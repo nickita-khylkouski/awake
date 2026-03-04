@@ -1,0 +1,605 @@
+#!/bin/bash
+# awake — Keep Mac alive while AI coding agents run
+# Uses pmset disablesleep 1 (the ONLY way to prevent lid-close sleep)
+# Requires: /etc/sudoers.d/pmset for passwordless sudo pmset
+
+set -uo pipefail
+# NOTE: no set -e — pgrep returns 1 when no match, which would kill the daemon
+
+# --- Defaults (overridable via ~/.config/awake/config) ---
+
+AGENTS="claude codex aider copilot amp opencode"
+POLL_INTERVAL=15
+GRACE_SECONDS=300       # 5 minutes
+BATTERY_CRITICAL=5      # force sleep even if agents running
+BATTERY_WARN=15         # send notification
+
+# --- Load config ---
+
+CONFIG_FILE="$HOME/.config/awake/config"
+[ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+
+# --- Constants ---
+
+PID_FILE="/tmp/awake.pid"
+STATE_FILE="/tmp/awake-state"
+LAST_ACTIVE_FILE="/tmp/awake-last-active"
+CAFFEINE_PID_FILE="/tmp/awake-caffeinate.pid"
+FOR_PID_FILE="/tmp/awake-for.pid"
+FOR_END_FILE="/tmp/awake-for-end"
+LOG_PREFIX="[awake]"
+
+# --- Helpers ---
+
+log() { echo "$LOG_PREFIX $(date '+%H:%M:%S') $*"; }
+
+now_epoch() { date +%s; }
+
+notify() {
+    osascript -e "display notification \"$2\" with title \"$1\"" 2>/dev/null || true
+}
+
+get_battery_pct() {
+    pmset -g batt | grep -Eo '[0-9]+%' | head -1 | tr -d '%'
+}
+
+is_charging() {
+    pmset -g batt | grep 'InternalBattery' | grep -qv 'discharging'
+}
+
+HOOK_STALE_SECONDS=120  # 2 min without heartbeat = idle/dead
+
+fresh_hook_files() {
+    # Return count of hook files with mtime < HOOK_STALE_SECONDS
+    # Also clean up stale ones
+    local now count=0
+    now=$(date +%s)
+    for f in /tmp/awake-claude-* /tmp/awake-codex-*; do
+        [ -f "$f" ] || continue
+        local mtime
+        mtime=$(stat -f %m "$f" 2>/dev/null) || continue
+        local age=$(( now - mtime ))
+        if [ "$age" -lt "$HOOK_STALE_SECONDS" ]; then
+            count=$(( count + 1 ))
+        else
+            log "Cleaning stale hook: $(basename "$f")" >&2
+            rm -f "$f"
+        fi
+    done
+    echo "$count"
+}
+
+agents_running() {
+    # Check FRESH hook state files (heartbeat within last 2 min)
+    local fresh
+    fresh=$(fresh_hook_files)
+    [ "$fresh" -gt 0 ] && return 0
+    # Check process list for non-Claude agents (Claude uses hooks)
+    local agent
+    for agent in $AGENTS; do
+        [ "$agent" = "claude" ] && continue  # Claude uses hooks only
+        pgrep -x "$agent" >/dev/null 2>&1 && return 0
+    done
+    # Aider fallback: may run as python3 -m aider
+    pgrep -f "python.*aider" >/dev/null 2>&1 && return 0
+    return 1
+}
+
+agent_summary() {
+    local parts=()
+    local agent count
+    for agent in $AGENTS; do
+        if [ "$agent" = "claude" ]; then
+            # Use hooks for claude (more accurate than pgrep)
+            count=$(fresh_hook_files)
+            [ "$count" -gt 0 ] && parts+=("claude ($count active)")
+        else
+            count=$(pgrep -x "$agent" 2>/dev/null | wc -l | tr -d ' ')
+            [ "$count" -gt 0 ] && parts+=("$agent ($count)")
+        fi
+    done
+    if [ ${#parts[@]} -eq 0 ]; then
+        echo "none"
+    else
+        local IFS=", "; echo "${parts[*]}"
+    fi
+}
+
+current_state() {
+    cat "$STATE_FILE" 2>/dev/null || echo "unknown"
+}
+
+activate_nosleep() {
+    # Use nosleep-full to distinguish from nosleep-display
+    local cs=$(current_state)
+    if [ "$cs" = "nosleep-full" ] || [ "$cs" = "nosleep" ]; then
+        # Migrate old format
+        [ "$cs" = "nosleep" ] && echo "nosleep-full" > "$STATE_FILE"
+        return 0
+    fi
+    log "Activating nosleep (full)"
+    sudo -n pmset -a disablesleep 1 standby 0 hibernatemode 0 sleep 0 displaysleep 0 2>/dev/null || {
+        log "ERROR: sudo pmset failed. Run: awake install"
+        return 1
+    }
+    # Kill tracked + any orphaned caffeinate -disu processes
+    if [ -f "$CAFFEINE_PID_FILE" ]; then
+        kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
+    fi
+    pkill -f "caffeinate -disu" 2>/dev/null || true
+    caffeinate -disu &>/dev/null &
+    echo $! > "$CAFFEINE_PID_FILE"
+    echo "nosleep-full" > "$STATE_FILE"
+}
+
+activate_nosleep_display() {
+    local cs=$(current_state)
+    if [ "$cs" = "nosleep-display" ]; then
+        return 0
+    fi
+    log "Activating nosleep (display sleep allowed)"
+    sudo -n pmset -a disablesleep 1 standby 0 hibernatemode 0 sleep 0 displaysleep 2 2>/dev/null || {
+        log "ERROR: sudo pmset failed. Run: awake install"
+        return 1
+    }
+    # Kill tracked + any orphaned caffeinate processes
+    if [ -f "$CAFFEINE_PID_FILE" ]; then
+        kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
+    fi
+    pkill -f "caffeinate -isu" 2>/dev/null || true
+    pkill -f "caffeinate -disu" 2>/dev/null || true
+    caffeinate -isu &>/dev/null &
+    echo $! > "$CAFFEINE_PID_FILE"
+    echo "nosleep-display" > "$STATE_FILE"
+}
+
+activate_yessleep() {
+    if [ "$(current_state)" = "normal" ]; then
+        return 0
+    fi
+    log "Restoring normal sleep settings"
+    # Kill any active for-timer so it doesn't fire later
+    if [ -f "$FOR_PID_FILE" ]; then
+        kill "$(cat "$FOR_PID_FILE")" 2>/dev/null || true
+        rm -f "$FOR_PID_FILE" "$FOR_END_FILE"
+    fi
+    if [ -f "$CAFFEINE_PID_FILE" ]; then
+        kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
+        rm -f "$CAFFEINE_PID_FILE"
+    fi
+    # Kill any orphaned caffeinate processes
+    pkill -f "caffeinate -[di]" 2>/dev/null || true
+    sudo -n pmset -a disablesleep 0 standby 1 hibernatemode 3 sleep 1 displaysleep 2 2>/dev/null || true
+    echo "normal" > "$STATE_FILE"
+}
+
+force_sleep() {
+    log "Forcing sleep"
+    activate_yessleep
+    sleep 2
+    sudo -n pmset sleepnow 2>/dev/null || true
+}
+
+cleanup() {
+    trap - EXIT INT TERM
+    log "Shutting down — restoring normal sleep"
+    activate_yessleep
+    rm -f "$PID_FILE" "$STATE_FILE" "$LAST_ACTIVE_FILE" "$CAFFEINE_PID_FILE" "$FOR_END_FILE"
+}
+
+parse_duration() {
+    # Accepts: 30m, 2h, 45 (bare = minutes)
+    local input="$1"
+    local num unit
+    if [[ "$input" =~ ^([0-9]+)(m|h)?$ ]]; then
+        num="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2]:-m}"
+        case "$unit" in
+            m) echo $(( num * 60 )) ;;
+            h) echo $(( num * 3600 )) ;;
+        esac
+    else
+        echo ""
+    fi
+}
+
+# --- Commands ---
+
+cmd_daemon_start() {
+    local background=false
+    [ "${1:-}" = "--bg" ] && background=true
+
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        log "Already running (PID $(cat "$PID_FILE")). Use: awake stop"
+        return 1
+    fi
+
+    if ! sudo -n pmset -g >/dev/null 2>&1; then
+        log "ERROR: passwordless sudo for pmset not configured"
+        log "Run: echo '$USER ALL=(ALL) NOPASSWD: /usr/bin/pmset' | sudo tee /etc/sudoers.d/pmset"
+        return 1
+    fi
+
+    if $background; then
+        log "Starting in background..."
+        nohup "$0" _daemon </dev/null >>/tmp/awake.log 2>&1 &
+        echo $! > "$PID_FILE"
+        log "PID $(cat "$PID_FILE") — log: /tmp/awake.log"
+        return 0
+    fi
+
+    "$0" _daemon
+}
+
+cmd_daemon() {
+    trap cleanup EXIT INT TERM
+    echo $$ > "$PID_FILE"
+    log "Daemon started (PID $$, poll=${POLL_INTERVAL}s, grace=${GRACE_SECONDS}s)"
+    log "Watching: $AGENTS"
+
+    local grace_start=0
+    local battery_warned=false
+
+    while true; do
+        # --- Battery check (always, regardless of agents) ---
+        local batt=$(get_battery_pct)
+        if [ -n "$batt" ] && ! is_charging; then
+            if [ "$batt" -le "$BATTERY_CRITICAL" ]; then
+                log "CRITICAL: Battery at ${batt}% — forcing sleep"
+                notify "awake" "Battery critical (${batt}%). Sleeping now."
+                force_sleep
+                grace_start=0
+                battery_warned=false
+                sleep "$POLL_INTERVAL"
+                continue
+            elif [ "$batt" -le "$BATTERY_WARN" ] && [ "$battery_warned" = false ]; then
+                log "WARNING: Battery at ${batt}%"
+                notify "awake" "Battery low (${batt}%). Plug in soon."
+                battery_warned=true
+            fi
+        else
+            battery_warned=false  # reset when charging or no battery
+        fi
+
+        # --- Agent detection ---
+        if agents_running; then
+            echo "$(now_epoch)" > "$LAST_ACTIVE_FILE"
+            grace_start=0
+            activate_nosleep
+        else
+            if [ "$grace_start" -eq 0 ]; then
+                grace_start=$(now_epoch)
+                log "No agents — grace period ($(( GRACE_SECONDS / 60 ))m)"
+                notify "awake" "No agents detected. Sleeping in $(( GRACE_SECONDS / 60 )) min."
+            fi
+
+            local elapsed=$(( $(now_epoch) - grace_start ))
+            local remaining=$(( GRACE_SECONDS - elapsed ))
+
+            if [ "$remaining" -le 0 ]; then
+                log "Grace expired — forcing sleep"
+                notify "awake" "Grace period expired. Sleeping now."
+                force_sleep
+                grace_start=0
+            else
+                if [[ "$(current_state)" == nosleep* ]]; then
+                    log "Grace: ${remaining}s remaining"
+                fi
+            fi
+        fi
+
+        sleep "$POLL_INTERVAL"
+    done
+}
+
+cmd_stop() {
+    # Kill for-timer if running
+    if [ -f "$FOR_PID_FILE" ]; then
+        local for_pid=$(cat "$FOR_PID_FILE")
+        kill "$for_pid" 2>/dev/null || true
+        rm -f "$FOR_PID_FILE" "$FOR_END_FILE"
+        log "Cancelled awake-for timer"
+    fi
+
+    if [ ! -f "$PID_FILE" ]; then
+        log "Daemon not running"
+    else
+        local pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            log "Stopping daemon (PID $pid)..."
+            kill "$pid"
+            sleep 1
+            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+            log "Stopped"
+        else
+            log "Stale pidfile (PID $pid not running)"
+            rm -f "$PID_FILE"
+        fi
+    fi
+
+    activate_yessleep
+    rm -f "$STATE_FILE" "$LAST_ACTIVE_FILE" "$CAFFEINE_PID_FILE"
+}
+
+cmd_status() {
+    local running=false
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        running=true
+    fi
+
+    local state=$(current_state)
+    local agents=$(agent_summary)
+
+    echo "awake daemon: $($running && echo "running (PID $(cat "$PID_FILE"))" || echo "not running")"
+    echo "power state:  $state"
+    echo "agents:       $agents"
+    echo "watching:     $AGENTS"
+
+    if [ -f "$LAST_ACTIVE_FILE" ]; then
+        local last=$(cat "$LAST_ACTIVE_FILE")
+        local ago=$(( $(now_epoch) - last ))
+        if [ "$ago" -lt 60 ]; then
+            echo "last active:  ${ago}s ago"
+        else
+            echo "last active:  $(( ago / 60 ))m ago"
+        fi
+    fi
+
+    # Battery
+    local batt=$(get_battery_pct)
+    if [ -n "$batt" ]; then
+        local charge_state="discharging"
+        is_charging && charge_state="charging"
+        echo "battery:      ${batt}% ($charge_state)"
+    else
+        echo "battery:      N/A (no battery or desktop Mac)"
+    fi
+
+    # For timer
+    if [ -f "$FOR_PID_FILE" ] && kill -0 "$(cat "$FOR_PID_FILE")" 2>/dev/null; then
+        echo "for timer:    active"
+    fi
+
+    # Sudoers
+    if sudo -n pmset -g >/dev/null 2>&1; then
+        echo "sudo pmset:   OK"
+    else
+        echo "sudo pmset:   NOT CONFIGURED"
+    fi
+}
+
+cmd_for() {
+    local duration_str="${1:-}"
+    if [ -z "$duration_str" ]; then
+        echo "Usage: awake for <duration>  (e.g., 30m, 2h, 45)"
+        return 1
+    fi
+
+    local secs=$(parse_duration "$duration_str")
+    if [ -z "$secs" ] || [ "$secs" -le 0 ] 2>/dev/null; then
+        echo "Invalid duration: $duration_str (use: 30m, 2h, or 45)"
+        return 1
+    fi
+
+    if ! sudo -n pmset -g >/dev/null 2>&1; then
+        log "ERROR: passwordless sudo not configured"
+        return 1
+    fi
+
+    # Kill previous for-timer
+    if [ -f "$FOR_PID_FILE" ]; then
+        kill "$(cat "$FOR_PID_FILE")" 2>/dev/null || true
+        rm -f "$FOR_PID_FILE" "$FOR_END_FILE"
+    fi
+
+    activate_nosleep
+    local mins=$(( secs / 60 ))
+    local end_epoch=$(( $(now_epoch) + secs ))
+    log "Nosleep for ${mins}m, then sleeping"
+    notify "awake" "Staying awake for ${mins} minutes."
+
+    # Write end time so UI can show countdown
+    echo "$end_epoch" > "$FOR_END_FILE"
+
+    # Background timer
+    (
+        sleep "$secs"
+        # Check if agents are still running — skip force-sleep if so
+        if any_agents_running; then
+            log "Timer expired but agents still running — staying awake"
+            notify "awake" "Timer expired but agents active. Staying awake."
+            rm -f "$FOR_PID_FILE" "$FOR_END_FILE"
+            exit 0
+        fi
+        log "Timer expired — forcing sleep"
+        notify "awake" "Timer expired. Sleeping now."
+        # Restore sleep settings
+        if [ -f "$CAFFEINE_PID_FILE" ]; then
+            kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
+            rm -f "$CAFFEINE_PID_FILE"
+        fi
+        pkill -f "caffeinate -[di]" 2>/dev/null || true
+        sudo -n pmset -a disablesleep 0 standby 1 hibernatemode 3 sleep 1 displaysleep 2 2>/dev/null || true
+        echo "normal" > "$STATE_FILE"
+        sleep 2
+        sudo -n pmset sleepnow 2>/dev/null || true
+        rm -f "$FOR_PID_FILE" "$FOR_END_FILE"
+    ) &
+    echo $! > "$FOR_PID_FILE"
+    disown
+
+    echo "nosleep ON for ${mins}m. Cancel with: awake stop"
+}
+
+cmd_run_command() {
+    if [ $# -eq 0 ]; then
+        echo "Usage: awake run <command...>"
+        return 1
+    fi
+
+    if ! sudo -n pmset -g >/dev/null 2>&1; then
+        log "ERROR: passwordless sudo not configured"
+        return 1
+    fi
+
+    activate_nosleep
+    log "Running: $*"
+
+    local exit_code=0
+    "$@" || exit_code=$?
+
+    activate_yessleep
+    log "Command finished (exit $exit_code)"
+    # Only clean up state if daemon is NOT running (it manages its own state)
+    if ! [ -f "$PID_FILE" ] || ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        rm -f "$CAFFEINE_PID_FILE" "$STATE_FILE"
+    fi
+    return $exit_code
+}
+
+cmd_ui() {
+    local app="$HOME/.local/bin/Awake.app"
+    if [ ! -d "$app" ]; then
+        log "ERROR: $app not found. Run: awake install"
+        return 1
+    fi
+    log "Launching menu bar UI..."
+    open "$app"
+}
+
+cmd_install() {
+    log "Installing hooks..."
+
+    # 1. Check sudoers
+    if ! sudo -n pmset -g >/dev/null 2>&1; then
+        log "WARNING: passwordless sudo not configured"
+        log "Run: echo '$USER ALL=(ALL) NOPASSWD: /usr/bin/pmset' | sudo tee /etc/sudoers.d/pmset"
+    else
+        log "sudoers: OK"
+    fi
+
+    # 2. Check hook script
+    if [ ! -x "$HOME/.local/bin/awake-hook" ]; then
+        log "WARNING: ~/.local/bin/awake-hook not found or not executable"
+    else
+        log "awake-hook: OK"
+    fi
+
+    # 3. Create config dir
+    mkdir -p "$HOME/.config/awake"
+    if [ ! -f "$CONFIG_FILE" ]; then
+        cat > "$CONFIG_FILE" << 'CONF'
+# awake configuration
+# AGENTS="claude codex aider copilot amp opencode"
+# GRACE_SECONDS=300
+# BATTERY_CRITICAL=5
+# BATTERY_WARN=15
+# POLL_INTERVAL=15
+CONF
+        log "Config: created $CONFIG_FILE"
+    else
+        log "Config: $CONFIG_FILE exists"
+    fi
+
+    # 4. Build and install Swift menu bar UI
+    if [ -f "$HOME/.local/bin/AwakeApp/main.swift" ]; then
+        log "Building Swift menu bar app..."
+        "$HOME/.local/bin/awake-build-ui"
+    else
+        log "WARNING: ~/.local/bin/AwakeApp/main.swift not found, skipping UI build"
+    fi
+
+    # 5. Patch Claude Code settings.json
+    local settings="$HOME/.claude/settings.json"
+    if [ -f "$settings" ]; then
+        python3 -c "
+import json
+with open('$settings') as f:
+    cfg = json.load(f)
+hooks = cfg.setdefault('hooks', {})
+for event in ['SessionStart', 'SessionEnd']:
+    entries = hooks.setdefault(event, [])
+    if not any('awake-hook' in str(h) for h in entries):
+        entries.append({
+            'matcher': '',
+            'hooks': [{'type': 'command', 'command': '$HOME/.local/bin/awake-hook', 'timeout': 3}]
+        })
+with open('$settings', 'w') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
+print('OK')
+"
+        log "Claude Code hooks: installed"
+    else
+        log "WARNING: $settings not found"
+    fi
+
+    # 5. Patch Codex config
+    local codex_cfg="$HOME/.codex/config.toml"
+    if [ -d "$HOME/.codex" ]; then
+        if grep -q "awake-notify" "$codex_cfg" 2>/dev/null; then
+            log "Codex notify: already configured"
+        else
+            echo "" >> "$codex_cfg"
+            echo "notify = \"$HOME/.local/bin/awake-notify\"" >> "$codex_cfg"
+            log "Codex notify: installed"
+        fi
+    else
+        log "Codex: not installed (skipping)"
+    fi
+
+    log "Done. Start with: awake start"
+}
+
+cmd_uninstall() {
+    log "Removing hooks..."
+
+    local settings="$HOME/.claude/settings.json"
+    if [ -f "$settings" ]; then
+        python3 -c "
+import json
+with open('$settings') as f:
+    cfg = json.load(f)
+hooks = cfg.get('hooks', {})
+for event in ['SessionStart', 'SessionEnd']:
+    if event in hooks:
+        hooks[event] = [h for h in hooks[event] if 'awake-hook' not in str(h)]
+        if not hooks[event]:
+            del hooks[event]
+with open('$settings', 'w') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
+print('OK')
+"
+        log "Claude Code hooks: removed"
+    fi
+
+    local codex_cfg="$HOME/.codex/config.toml"
+    if [ -f "$codex_cfg" ]; then
+        sed -i '' '/awake-notify/d' "$codex_cfg"
+        log "Codex notify: removed"
+    fi
+
+    log "Done"
+}
+
+# --- Main ---
+
+case "${1:-}" in
+    start)      cmd_daemon_start --bg ;;
+    stop)       cmd_stop ;;
+    sleep)      force_sleep ;;
+    nosleep)    activate_nosleep ;;
+    nosleep-display) activate_nosleep_display ;;
+    yessleep)   activate_yessleep ;;
+    status)     cmd_status ;;
+    for)        cmd_for "${2:-}" ;;
+    run)        shift; cmd_run_command "$@" ;;
+    ui)         cmd_ui ;;
+    install)    cmd_install ;;
+    uninstall)  cmd_uninstall ;;
+    _daemon)    cmd_daemon ;;
+    "")         cmd_daemon_start ;;
+    *)          echo "Usage: awake [start|stop|sleep|nosleep|nosleep-display|yessleep|status|for <dur>|run <cmd>|ui|install|uninstall]"
+                exit 1 ;;
+esac

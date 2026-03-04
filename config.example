@@ -1,0 +1,6 @@
+# awake configuration
+# AGENTS="claude codex aider copilot amp opencode"
+# GRACE_SECONDS=300
+# BATTERY_CRITICAL=5
+# BATTERY_WARN=15
+# POLL_INTERVAL=15

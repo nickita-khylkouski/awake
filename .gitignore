@@ -1,0 +1,17 @@
+# Build artifacts
+*.app/
+AwakeUI
+*.o
+*.d
+
+# macOS
+.DS_Store
+._*
+
+# Config (user-specific)
+config
+
+# Sensitive
+.env
+*.key
+*.pem
