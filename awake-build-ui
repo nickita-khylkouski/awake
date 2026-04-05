@@ -52,6 +52,8 @@ cat > "$APP_DIR/Info.plist" << 'PLIST'
     <string>AwakeUI</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>LSUIElement</key>
+    <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

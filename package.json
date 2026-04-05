@@ -1,0 +1,36 @@
+{
+  "name": "awake-agent",
+  "version": "2.0.0",
+  "description": "Keep your Mac awake while AI coding agents run.",
+  "license": "MIT",
+  "os": [
+    "darwin"
+  ],
+  "bin": {
+    "awake": "./awake",
+    "awake-build-ui": "./awake-build-ui",
+    "awake-hook": "./awake-hook",
+    "awake-notify": "./awake-notify"
+  },
+  "files": [
+    "README.md",
+    "config.example",
+    "awake",
+    "awake-build-ui",
+    "awake-hook",
+    "awake-notify",
+    "install.sh",
+    "ui/main.swift"
+  ],
+  "scripts": {
+    "verify:shell": "bash -n awake && bash -n awake-build-ui && bash -n awake-hook && bash -n awake-notify && bash -n install.sh"
+  },
+  "keywords": [
+    "macos",
+    "menubar",
+    "sleep",
+    "claude",
+    "codex",
+    "agent"
+  ]
+}

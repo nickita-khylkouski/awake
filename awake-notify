@@ -1,0 +1,7 @@
+#!/bin/bash
+# awake-notify — Codex notify hook bridge for awake heartbeats
+
+set -euo pipefail
+
+script_dir="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+"$script_dir/awake-hook" codex

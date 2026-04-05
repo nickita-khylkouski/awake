@@ -21,6 +21,25 @@ CONFIG_FILE="$HOME/.config/awake/config"
 
 # --- Constants ---
 
+resolve_script_path() {
+    local src="${1:-$0}"
+    while [ -L "$src" ]; do
+        local dir
+        dir="$(CDPATH='' cd -- "$(dirname -- "$src")" && pwd)"
+        src="$(readlink "$src")"
+        [[ "$src" != /* ]] && src="$dir/$src"
+    done
+    local dir
+    dir="$(CDPATH='' cd -- "$(dirname -- "$src")" && pwd)"
+    echo "$dir/$(basename "$src")"
+}
+
+SCRIPT_PATH="$(resolve_script_path "${BASH_SOURCE[0]:-$0}")"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
+LOCAL_BIN_DIR="$HOME/.local/bin"
+LOCAL_APP_SRC_DIR="$LOCAL_BIN_DIR/AwakeApp"
+LOCAL_APP_SRC_FILE="$LOCAL_APP_SRC_DIR/main.swift"
+REPO_APP_SRC_FILE="$SCRIPT_DIR/ui/main.swift"
 PID_FILE="/tmp/awake.pid"
 STATE_FILE="/tmp/awake-state"
 LAST_ACTIVE_FILE="/tmp/awake-last-active"
@@ -34,6 +53,17 @@ LOG_PREFIX="[awake]"
 log() { echo "$LOG_PREFIX $(date '+%H:%M:%S') $*"; }
 
 now_epoch() { date +%s; }
+
+copy_if_present() {
+    local src="$1"
+    local dst="$2"
+    [ -f "$src" ] || return 1
+    mkdir -p "$(dirname "$dst")"
+    if [ "$(cd -- "$(dirname "$src")" && pwd)/$(basename "$src")" != "$(cd -- "$(dirname "$dst")" && pwd 2>/dev/null || true)/$(basename "$dst")" ]; then
+        cp "$src" "$dst"
+    fi
+    chmod +x "$dst" 2>/dev/null || true
+}
 
 notify() {
     osascript -e "display notification \"$2\" with title \"$1\"" 2>/dev/null || true
@@ -109,6 +139,17 @@ current_state() {
     cat "$STATE_FILE" 2>/dev/null || echo "unknown"
 }
 
+restore_normal_sleep_settings() {
+    if [ -f "$CAFFEINE_PID_FILE" ]; then
+        kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
+        rm -f "$CAFFEINE_PID_FILE"
+    fi
+    # Kill any orphaned caffeinate processes
+    pkill -f "caffeinate -[di]" 2>/dev/null || true
+    sudo -n pmset -a disablesleep 0 standby 1 hibernatemode 3 sleep 1 displaysleep 2 2>/dev/null || true
+    echo "normal" > "$STATE_FILE"
+}
+
 activate_nosleep() {
     # Use nosleep-full to distinguish from nosleep-display
     local cs=$(current_state)
@@ -163,14 +204,7 @@ activate_yessleep() {
         kill "$(cat "$FOR_PID_FILE")" 2>/dev/null || true
         rm -f "$FOR_PID_FILE" "$FOR_END_FILE"
     fi
-    if [ -f "$CAFFEINE_PID_FILE" ]; then
-        kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
-        rm -f "$CAFFEINE_PID_FILE"
-    fi
-    # Kill any orphaned caffeinate processes
-    pkill -f "caffeinate -[di]" 2>/dev/null || true
-    sudo -n pmset -a disablesleep 0 standby 1 hibernatemode 3 sleep 1 displaysleep 2 2>/dev/null || true
-    echo "normal" > "$STATE_FILE"
+    restore_normal_sleep_settings
 }
 
 force_sleep() {
@@ -395,8 +429,8 @@ cmd_for() {
     activate_nosleep
     local mins=$(( secs / 60 ))
     local end_epoch=$(( $(now_epoch) + secs ))
-    log "Nosleep for ${mins}m, then sleeping"
-    notify "awake" "Staying awake for ${mins} minutes."
+    log "Nosleep for ${mins}m, then restoring Sleep OK"
+    notify "awake" "Staying awake for ${mins} minutes, then restoring Sleep OK."
 
     # Write end time so UI can show countdown
     echo "$end_epoch" > "$FOR_END_FILE"
@@ -405,30 +439,21 @@ cmd_for() {
     (
         sleep "$secs"
         # Check if agents are still running — skip force-sleep if so
-        if any_agents_running; then
+        if agents_running; then
             log "Timer expired but agents still running — staying awake"
             notify "awake" "Timer expired but agents active. Staying awake."
             rm -f "$FOR_PID_FILE" "$FOR_END_FILE"
             exit 0
         fi
-        log "Timer expired — forcing sleep"
-        notify "awake" "Timer expired. Sleeping now."
-        # Restore sleep settings
-        if [ -f "$CAFFEINE_PID_FILE" ]; then
-            kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
-            rm -f "$CAFFEINE_PID_FILE"
-        fi
-        pkill -f "caffeinate -[di]" 2>/dev/null || true
-        sudo -n pmset -a disablesleep 0 standby 1 hibernatemode 3 sleep 1 displaysleep 2 2>/dev/null || true
-        echo "normal" > "$STATE_FILE"
-        sleep 2
-        sudo -n pmset sleepnow 2>/dev/null || true
+        log "Timer expired — restoring Sleep OK"
+        notify "awake" "Timer expired. Sleep OK restored."
+        restore_normal_sleep_settings
         rm -f "$FOR_PID_FILE" "$FOR_END_FILE"
     ) &
     echo $! > "$FOR_PID_FILE"
     disown
 
-    echo "nosleep ON for ${mins}m. Cancel with: awake stop"
+    echo "nosleep ON for ${mins}m, then Sleep OK. Cancel with: awake stop"
 }
 
 cmd_run_command() {
@@ -458,7 +483,7 @@ cmd_run_command() {
 }
 
 cmd_ui() {
-    local app="$HOME/.local/bin/Awake.app"
+    local app="$LOCAL_BIN_DIR/Awake.app"
     if [ ! -d "$app" ]; then
         log "ERROR: $app not found. Run: awake install"
         return 1
@@ -468,7 +493,23 @@ cmd_ui() {
 }
 
 cmd_install() {
-    log "Installing hooks..."
+    log "Installing awake..."
+
+    mkdir -p "$LOCAL_BIN_DIR" "$LOCAL_APP_SRC_DIR" "$HOME/.config/awake"
+
+    # Bootstrap local files from the current installation source when available.
+    copy_if_present "$SCRIPT_DIR/awake" "$LOCAL_BIN_DIR/awake" || true
+    copy_if_present "$SCRIPT_DIR/awake-build-ui" "$LOCAL_BIN_DIR/awake-build-ui" || true
+    copy_if_present "$SCRIPT_DIR/awake-hook" "$LOCAL_BIN_DIR/awake-hook" || true
+    copy_if_present "$SCRIPT_DIR/awake-notify" "$LOCAL_BIN_DIR/awake-notify" || true
+    if [ -f "$REPO_APP_SRC_FILE" ]; then
+        cp "$REPO_APP_SRC_FILE" "$LOCAL_APP_SRC_FILE"
+    fi
+
+    if ! echo "$PATH" | tr ':' '\n' | grep -Fxq "$LOCAL_BIN_DIR"; then
+        log "WARNING: $LOCAL_BIN_DIR is not on PATH"
+        log "Add this to your shell profile: export PATH=\"$LOCAL_BIN_DIR:\$PATH\""
+    fi
 
     # 1. Check sudoers
     if ! sudo -n pmset -g >/dev/null 2>&1; then
@@ -478,15 +519,19 @@ cmd_install() {
         log "sudoers: OK"
     fi
 
-    # 2. Check hook script
+    # 2. Check helper scripts
     if [ ! -x "$HOME/.local/bin/awake-hook" ]; then
         log "WARNING: ~/.local/bin/awake-hook not found or not executable"
     else
         log "awake-hook: OK"
     fi
+    if [ ! -x "$HOME/.local/bin/awake-notify" ]; then
+        log "WARNING: ~/.local/bin/awake-notify not found or not executable"
+    else
+        log "awake-notify: OK"
+    fi
 
     # 3. Create config dir
-    mkdir -p "$HOME/.config/awake"
     if [ ! -f "$CONFIG_FILE" ]; then
         cat > "$CONFIG_FILE" << 'CONF'
 # awake configuration
@@ -502,11 +547,16 @@ CONF
     fi
 
     # 4. Build and install Swift menu bar UI
-    if [ -f "$HOME/.local/bin/AwakeApp/main.swift" ]; then
+    if [ -f "$LOCAL_APP_SRC_FILE" ]; then
+        if ! xcode-select -p >/dev/null 2>&1; then
+            log "WARNING: Xcode Command Line Tools not found"
+            log "Run: xcode-select --install"
+        else
         log "Building Swift menu bar app..."
-        "$HOME/.local/bin/awake-build-ui"
+        "$LOCAL_BIN_DIR/awake-build-ui"
+        fi
     else
-        log "WARNING: ~/.local/bin/AwakeApp/main.swift not found, skipping UI build"
+        log "WARNING: $LOCAL_APP_SRC_FILE not found, skipping UI build"
     fi
 
     # 5. Patch Claude Code settings.json
@@ -517,13 +567,12 @@ import json
 with open('$settings') as f:
     cfg = json.load(f)
 hooks = cfg.setdefault('hooks', {})
-for event in ['SessionStart', 'SessionEnd']:
-    entries = hooks.setdefault(event, [])
-    if not any('awake-hook' in str(h) for h in entries):
-        entries.append({
-            'matcher': '',
-            'hooks': [{'type': 'command', 'command': '$HOME/.local/bin/awake-hook', 'timeout': 3}]
-        })
+entries = hooks.setdefault('PreToolUse', [])
+if not any('awake-hook' in str(h) for h in entries):
+    entries.append({
+        'matcher': '',
+            'hooks': [{'type': 'command', 'command': '$LOCAL_BIN_DIR/awake-hook claude', 'timeout': 3}]
+    })
 with open('$settings', 'w') as f:
     json.dump(cfg, f, indent=2)
     f.write('\n')
@@ -541,7 +590,7 @@ print('OK')
             log "Codex notify: already configured"
         else
             echo "" >> "$codex_cfg"
-            echo "notify = \"$HOME/.local/bin/awake-notify\"" >> "$codex_cfg"
+            echo "notify = \"$LOCAL_BIN_DIR/awake-notify\"" >> "$codex_cfg"
             log "Codex notify: installed"
         fi
     else
@@ -561,11 +610,10 @@ import json
 with open('$settings') as f:
     cfg = json.load(f)
 hooks = cfg.get('hooks', {})
-for event in ['SessionStart', 'SessionEnd']:
-    if event in hooks:
-        hooks[event] = [h for h in hooks[event] if 'awake-hook' not in str(h)]
-        if not hooks[event]:
-            del hooks[event]
+if 'PreToolUse' in hooks:
+    hooks['PreToolUse'] = [h for h in hooks['PreToolUse'] if 'awake-hook' not in str(h)]
+    if not hooks['PreToolUse']:
+        del hooks['PreToolUse']
 with open('$settings', 'w') as f:
     json.dump(cfg, f, indent=2)
     f.write('\n')

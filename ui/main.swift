@@ -1163,11 +1163,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // No menu assigned — we show it programmatically on right-click
 
-        // Switch to accessory after macOS registers the status item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            NSApp.setActivationPolicy(.accessory)
-        }
-
         // Floating panel
         let panelRect = NSRect(x: 0, y: 0, width: 340, height: 580)
         panel = AwakePanel(contentRect: panelRect)
@@ -1448,7 +1443,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - Entry Point
 
 let app = NSApplication.shared
-app.setActivationPolicy(.regular)  // Start as regular so macOS registers the status item
+app.setActivationPolicy(.accessory)
 let delegate = AppDelegate()
 app.delegate = delegate
 app.run()

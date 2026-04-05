@@ -72,6 +72,13 @@ Before installing, you need:
 
 ## Install
 
+`awake` now supports two install paths:
+
+- Source install: best if you're hacking on the repo
+- npm install: best if you want the CLI to bootstrap the local menubar app for you
+
+Both end up building the same native `Awake.app` menubar app in `~/.local/bin/Awake.app`.
+
 ### Step 1: Clone the repo
 
 ```bash
@@ -79,13 +86,30 @@ git clone https://github.com/nickita-khylkouski/awake.git
 cd awake
 ```
 
-### Step 2: Set up passwordless sudo for pmset
-
-This is required. Without it, the daemon can't change sleep settings.
+### Step 2: Run the installer
 
 ```bash
-# Option A: Use the install command (it will tell you what to do)
-# Option B: Do it manually:
+./install.sh
+```
+
+This does:
+- Copies `awake`, `awake-build-ui`, `awake-hook`, and `awake-notify` into `~/.local/bin`
+- Creates `~/.config/awake/config` with default settings
+- Builds the menu bar app
+- Patches Claude Code `~/.claude/settings.json` to add heartbeat hooks (if Claude Code is installed)
+- Patches Codex `~/.codex/config.toml` notification hook (if Codex is installed)
+- Warns if sudoers isn't set up
+
+Make sure `~/.local/bin` is on your PATH. Add to your `~/.zshrc` if needed:
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+### Step 3: Set up passwordless sudo for pmset
+
+This is required for lid-close prevention. If `./install.sh` warns about it, run:
+
+```bash
 sudo bash -c 'echo "$(whoami) ALL=(ALL) NOPASSWD: /usr/bin/pmset" > /etc/sudoers.d/pmset'
 sudo chmod 440 /etc/sudoers.d/pmset
 ```
@@ -95,50 +119,25 @@ Verify it works:
 sudo -n pmset -g    # Should print settings without asking for password
 ```
 
-### Step 3: Copy files to ~/.local/bin
-
-```bash
-mkdir -p ~/.local/bin
-cp awake ~/.local/bin/awake
-cp awake-build-ui ~/.local/bin/awake-build-ui
-chmod +x ~/.local/bin/awake ~/.local/bin/awake-build-ui
-
-mkdir -p ~/.local/bin/AwakeApp
-cp ui/main.swift ~/.local/bin/AwakeApp/main.swift
-```
-
-Make sure `~/.local/bin` is on your PATH. Add to your `~/.zshrc` if needed:
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-### Step 4: Build the menu bar app
-
-```bash
-awake-build-ui
-```
-
-This compiles `main.swift` into `~/.local/bin/Awake.app` — a standalone macOS app bundle with no dependencies.
-
-### Step 5: Run the install command
-
-```bash
-awake install
-```
-
-This does:
-- Creates `~/.config/awake/config` with default settings
-- Builds the menu bar app (if source exists)
-- Patches Claude Code `~/.claude/settings.json` to add heartbeat hooks (if Claude Code is installed)
-- Patches Codex `~/.codex/config.toml` notification (if Codex is installed)
-- Warns if sudoers isn't set up
-
-### Step 6: Start
+### Step 4: Start
 
 ```bash
 awake start              # Start the daemon
 open ~/.local/bin/Awake.app   # Open the menu bar app (optional)
 ```
+
+### npm install
+
+If you want the CLI first and the app second:
+
+```bash
+npm install -g awake-agent
+awake install
+awake start
+open ~/.local/bin/Awake.app
+```
+
+`awake install` resolves its own package location, copies the helper files into `~/.local/bin`, builds the app bundle, and wires supported agent integrations.
 
 ### Optional: Auto-start on login
 
@@ -196,8 +195,8 @@ awake nosleep            # Manual nosleep (full — prevents all sleep including
 awake nosleep-display    # Nosleep but allow display to turn off (saves power)
 awake yessleep           # Restore normal sleep settings manually
 
-awake for 2h             # Nosleep for 2 hours, then force-sleep
-awake for 30m            # Nosleep for 30 minutes
+awake for 2h             # Nosleep for 2 hours, then restore Sleep OK
+awake for 30m            # Nosleep for 30 minutes, then restore Sleep OK
 awake sleep              # Stop everything and put the Mac to sleep immediately
 
 awake run <cmd>          # Keep awake while <cmd> runs, then restore sleep
@@ -276,7 +275,7 @@ The daemon runs `pgrep -x <name>` for each, so the name must match the process n
 
 For the most accurate agent detection, set up heartbeat hooks. The `awake install` command does this automatically, but here's how it works:
 
-Claude Code supports [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) — shell commands that run on events like tool use. Add a hook that touches a file on every tool use:
+Claude Code supports [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) — shell commands that run on events like tool use. `awake install` configures a `PreToolUse` heartbeat automatically. The resulting hook looks like:
 
 **In `~/.claude/settings.json`:**
 ```json
@@ -288,7 +287,7 @@ Claude Code supports [hooks](https://docs.anthropic.com/en/docs/claude-code/hook
         "hooks": [
           {
             "type": "command",
-            "command": "touch /tmp/awake-claude-$(echo $SESSION_ID | head -c 16)",
+            "command": "$HOME/.local/bin/awake-hook claude",
             "timeout": 3
           }
         ]
@@ -308,6 +307,8 @@ This creates/updates a file per session. The daemon checks modification times �
 ~/.local/bin/
   awake                  # Daemon + CLI script (bash)
   awake-build-ui         # Build script for the Swift app
+  awake-hook             # Claude/Codex heartbeat helper
+  awake-notify           # Codex notify bridge
   AwakeApp/
     main.swift           # SwiftUI menu bar app source
   Awake.app/             # Compiled app bundle (created by awake-build-ui)

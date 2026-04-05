@@ -1,0 +1,31 @@
+#!/bin/bash
+# awake-hook — touch a short-lived heartbeat file for active agent sessions
+
+set -euo pipefail
+
+source_name="${1:-auto}"
+
+if [ "$source_name" = "auto" ]; then
+    if [ -n "${SESSION_ID:-}" ] || [ -n "${CLAUDE_SESSION_ID:-}" ]; then
+        source_name="claude"
+    else
+        source_name="codex"
+    fi
+fi
+
+case "$source_name" in
+    claude) prefix="awake-claude" ;;
+    codex) prefix="awake-codex" ;;
+    *)
+        echo "usage: awake-hook [claude|codex]" >&2
+        exit 1
+        ;;
+esac
+
+session_id="${SESSION_ID:-${CLAUDE_SESSION_ID:-${CODEX_SESSION_ID:-${CODEX_RUN_ID:-}}}}"
+if [ -z "$session_id" ]; then
+    session_id="$(hostname -s)-$$"
+fi
+
+session_id="$(printf '%s' "$session_id" | tr -cs '[:alnum:]._-:' '-')"
+touch "/tmp/${prefix}-$(printf '%.16s' "$session_id")"
