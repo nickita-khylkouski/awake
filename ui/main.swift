@@ -1522,20 +1522,31 @@ struct ContentView: View {
 
     private var heroSection: some View {
         HStack(spacing: 14) {
-            ZStack {
-                Circle()
-                    .fill(vm.isNosleep ? Color.green.opacity(0.12) : Color.secondary.opacity(0.08))
-                    .frame(width: 48, height: 48)
-
+            Button(action: {
                 if vm.isNosleep {
-                    PulsingRing(color: .green)
-                        .frame(width: 48, height: 48)
+                    vm.nosleepOff()
+                } else {
+                    vm.nosleepOn()
                 }
+            }) {
+                ZStack {
+                    Circle()
+                        .fill(vm.isNosleep ? Color.green.opacity(0.12) : Color.secondary.opacity(0.08))
+                        .frame(width: 48, height: 48)
 
-                Image(systemName: vm.isNosleep ? "bolt.fill" : "moon.zzz.fill")
-                    .font(.system(size: 18, weight: .medium))
-                    .foregroundColor(vm.isNosleep ? .green : .secondary.opacity(0.5))
+                    if vm.isNosleep {
+                        PulsingRing(color: .green)
+                            .frame(width: 48, height: 48)
+                    }
+
+                    Image(systemName: vm.isNosleep ? "bolt.fill" : "moon.zzz.fill")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundColor(vm.isNosleep ? .green : .secondary.opacity(0.5))
+                }
             }
+            .buttonStyle(.plain)
+            .disabled(vm.isBusy)
+            .help(vm.isNosleep ? "Click to switch to Sleep OK" : "Click to turn Awake on")
             .animation(.easeInOut(duration: 0.4), value: vm.isNosleep)
 
             VStack(alignment: .leading, spacing: 2) {
@@ -2158,14 +2169,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         AppDelegate.shared = self
         applyDockIconVisibility()
 
-        // Status bar item — icon-only so it remains visible on crowded menu bars.
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        // Status bar item — compact by default, but wide enough to show uptime while awake.
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.isVisible = true
         statusItem.autosaveName = "com.awake.statusitem"
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: "moon.zzz", accessibilityDescription: "awake")
             button.image?.size = NSSize(width: 14, height: 14)
-            button.imagePosition = .imageOnly
+            button.imagePosition = .imageLeading
+            button.font = NSFont.monospacedSystemFont(ofSize: 9, weight: .medium)
+            button.title = ""
             // Left-click = open panel, Right-click = menu
             button.target = self
             button.action = #selector(statusItemClicked(_:))
@@ -2330,6 +2343,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let state = readFile(STATE_FILE) ?? "unknown"
         let isNosleep = state.hasPrefix("nosleep")
         guard let button = statusItem.button else { return }
+        let textAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold),
+            .foregroundColor: NSColor.labelColor
+        ]
 
         if isNosleep {
             let img = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: "nosleep")
@@ -2337,7 +2354,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.image = img
             button.image?.size = NSSize(width: 13, height: 13)
             button.contentTintColor = .systemGreen
-            let uptimeSuffix = getUptime().map { " (\(formatDuration(Int($0))))" } ?? ""
+            let uptimeText = getUptime().map { formatDuration(Int($0)) } ?? ""
+            button.title = ""
+            button.attributedTitle = NSAttributedString(
+                string: uptimeText.isEmpty ? "" : " \(uptimeText)",
+                attributes: textAttributes
+            )
+            let uptimeSuffix = uptimeText.isEmpty ? "" : " (\(uptimeText))"
             button.toolTip = "Awake\nNosleep active\(uptimeSuffix)\nLeft-click: open panel\nRight-click: quick menu\nHotkey: Ctrl+Shift+A"
         } else {
             let img = NSImage(systemSymbolName: "moon.zzz", accessibilityDescription: "sleep ok")
@@ -2345,6 +2368,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.image = img
             button.image?.size = NSSize(width: 13, height: 13)
             button.contentTintColor = nil
+            button.title = ""
+            button.attributedTitle = NSAttributedString(string: "", attributes: textAttributes)
             button.toolTip = "Awake\nNormal sleep\nLeft-click: open panel\nRight-click: quick menu\nHotkey: Ctrl+Shift+A"
         }
     }
