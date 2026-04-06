@@ -354,7 +354,7 @@ If it shows 0, something is resetting it. Check if another tool (Amphetamine, et
 ### Menu bar icon doesn't appear
 On MacBooks with a notch, the menu bar has limited space. If too many icons are present, macOS silently hides new ones. Try:
 - Quit other menu bar apps to free space
-- Use a menu bar manager like [Ice](https://github.com/jordanbaird/Ice) to manage visibility
+- If your menu bar is crowded, use Awake's Dock icon, hotkey, or menu bar control permissions to keep it easy to reopen
 - The panel still works via `Ctrl+Shift+A` even without the icon
 
 ### Orphaned caffeinate processes

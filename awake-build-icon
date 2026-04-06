@@ -1,0 +1,98 @@
+#!/bin/bash
+# awake-build-icon — Generate a simple app icon for Awake and package it as .icns
+
+set -euo pipefail
+
+OUT_ICNS="${1:-$HOME/.local/bin/Awake.app/Contents/Resources/Awake.icns}"
+WORKDIR="$(mktemp -d /tmp/awake-icon.XXXXXX)"
+ICONSET_DIR="$WORKDIR/Awake.iconset"
+BASE_PNG="$WORKDIR/base.png"
+
+mkdir -p "$ICONSET_DIR"
+
+swift - "$BASE_PNG" <<'SWIFT'
+import AppKit
+
+let outputPath = CommandLine.arguments[1]
+let size = CGSize(width: 1024, height: 1024)
+
+let rep = NSBitmapImageRep(
+    bitmapDataPlanes: nil,
+    pixelsWide: Int(size.width),
+    pixelsHigh: Int(size.height),
+    bitsPerSample: 8,
+    samplesPerPixel: 4,
+    hasAlpha: true,
+    isPlanar: false,
+    colorSpaceName: .deviceRGB,
+    bytesPerRow: 0,
+    bitsPerPixel: 0
+)!
+rep.size = size
+
+NSGraphicsContext.saveGraphicsState()
+NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+
+let rect = CGRect(origin: .zero, size: size)
+NSColor.clear.setFill()
+rect.fill()
+
+let outer = NSBezierPath(roundedRect: rect.insetBy(dx: 72, dy: 72), xRadius: 220, yRadius: 220)
+let bg = NSGradient(colors: [
+    NSColor(calibratedRed: 0.12, green: 0.16, blue: 0.18, alpha: 1),
+    NSColor(calibratedRed: 0.20, green: 0.25, blue: 0.21, alpha: 1)
+])!
+bg.draw(in: outer, angle: -90)
+
+NSColor(calibratedWhite: 1, alpha: 0.08).setStroke()
+outer.lineWidth = 10
+outer.stroke()
+
+let innerGlow = NSBezierPath(roundedRect: rect.insetBy(dx: 120, dy: 120), xRadius: 180, yRadius: 180)
+NSColor(calibratedRed: 0.48, green: 0.97, blue: 0.52, alpha: 0.08).setFill()
+innerGlow.fill()
+
+let bolt = NSBezierPath()
+bolt.move(to: CGPoint(x: 565, y: 818))
+bolt.line(to: CGPoint(x: 414, y: 564))
+bolt.line(to: CGPoint(x: 520, y: 564))
+bolt.line(to: CGPoint(x: 448, y: 276))
+bolt.line(to: CGPoint(x: 626, y: 516))
+bolt.line(to: CGPoint(x: 515, y: 516))
+bolt.close()
+
+NSColor(calibratedRed: 0.95, green: 0.99, blue: 0.73, alpha: 1).setFill()
+bolt.fill()
+
+let boltGlow = NSShadow()
+boltGlow.shadowBlurRadius = 36
+boltGlow.shadowColor = NSColor(calibratedRed: 0.55, green: 1.0, blue: 0.60, alpha: 0.45)
+boltGlow.shadowOffset = .zero
+boltGlow.set()
+NSColor(calibratedRed: 0.61, green: 1.0, blue: 0.67, alpha: 0.16).setFill()
+bolt.fill()
+
+NSGraphicsContext.restoreGraphicsState()
+
+guard let data = rep.representation(using: .png, properties: [:]) else {
+    fputs("failed to encode icon PNG\n", stderr)
+    exit(1)
+}
+try data.write(to: URL(fileURLWithPath: outputPath))
+SWIFT
+
+cp "$BASE_PNG" "$ICONSET_DIR/icon_512x512@2x.png"
+sips -z 16 16     "$BASE_PNG" --out "$ICONSET_DIR/icon_16x16.png" >/dev/null
+sips -z 32 32     "$BASE_PNG" --out "$ICONSET_DIR/icon_16x16@2x.png" >/dev/null
+sips -z 32 32     "$BASE_PNG" --out "$ICONSET_DIR/icon_32x32.png" >/dev/null
+sips -z 64 64     "$BASE_PNG" --out "$ICONSET_DIR/icon_32x32@2x.png" >/dev/null
+sips -z 128 128   "$BASE_PNG" --out "$ICONSET_DIR/icon_128x128.png" >/dev/null
+sips -z 256 256   "$BASE_PNG" --out "$ICONSET_DIR/icon_128x128@2x.png" >/dev/null
+sips -z 256 256   "$BASE_PNG" --out "$ICONSET_DIR/icon_256x256.png" >/dev/null
+sips -z 512 512   "$BASE_PNG" --out "$ICONSET_DIR/icon_256x256@2x.png" >/dev/null
+sips -z 512 512   "$BASE_PNG" --out "$ICONSET_DIR/icon_512x512.png" >/dev/null
+
+mkdir -p "$(dirname "$OUT_ICNS")"
+iconutil -c icns "$ICONSET_DIR" -o "$OUT_ICNS"
+
+echo "$OUT_ICNS"

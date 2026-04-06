@@ -9,6 +9,11 @@ SRC_DIR="$HOME/.local/bin/AwakeApp"
 SRC_FILE="$SRC_DIR/main.swift"
 BINARY="$SRC_DIR/AwakeUI"
 APP_DIR="$HOME/.local/bin/Awake.app/Contents"
+APP_ROOT="$HOME/.local/bin/Awake.app"
+RESOURCE_BIN_DIR="$APP_DIR/Resources/bin"
+SCRIPT_SOURCE_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+ICON_SCRIPT="$SCRIPT_SOURCE_DIR/awake-build-icon"
+ICON_FILE="$APP_DIR/Resources/Awake.icns"
 
 log() { echo "[awake-build-ui] $(date '+%H:%M:%S') $*"; }
 
@@ -27,12 +32,26 @@ log "Compiled: $(ls -lh "$BINARY" | awk '{print $5}') arm64 binary"
 
 # --- 3. Create/update app bundle ---
 
-mkdir -p "$APP_DIR/MacOS" "$APP_DIR/Resources"
+mkdir -p "$APP_DIR/MacOS" "$APP_DIR/Resources" "$RESOURCE_BIN_DIR"
 
 # Copy binary into bundle
 cp "$BINARY" "$APP_DIR/MacOS/AwakeUI"
 chmod +x "$APP_DIR/MacOS/AwakeUI"
 log "Installed binary to $APP_DIR/MacOS/AwakeUI"
+
+# Copy bundled helper scripts so the .app is self-contained
+for tool in awake awake-hook awake-notify awake-build-ui awake-build-icon; do
+    if [ -f "$SCRIPT_SOURCE_DIR/$tool" ]; then
+        cp "$SCRIPT_SOURCE_DIR/$tool" "$RESOURCE_BIN_DIR/$tool"
+        chmod +x "$RESOURCE_BIN_DIR/$tool"
+    fi
+done
+log "Bundled helper scripts into $RESOURCE_BIN_DIR"
+
+if [ -x "$ICON_SCRIPT" ]; then
+    "$ICON_SCRIPT" "$ICON_FILE" >/dev/null
+    log "Generated app icon at $ICON_FILE"
+fi
 
 # Write Info.plist (always overwrite to keep in sync)
 cat > "$APP_DIR/Info.plist" << 'PLIST'
@@ -50,10 +69,10 @@ cat > "$APP_DIR/Info.plist" << 'PLIST'
     <string>2.0</string>
     <key>CFBundleExecutable</key>
     <string>AwakeUI</string>
+    <key>CFBundleIconFile</key>
+    <string>Awake</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
-    <key>LSUIElement</key>
-    <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>
@@ -70,10 +89,10 @@ fi
 # --- 4. Ad-hoc code sign (required for `open` to launch reliably) ---
 
 codesign --force --sign - "$APP_DIR/MacOS/AwakeUI" 2>/dev/null
-codesign --force --sign - "$HOME/.local/bin/Awake.app" 2>/dev/null
+codesign --force --sign - "$APP_ROOT" 2>/dev/null
 log "Ad-hoc signed binary and bundle"
 
 # --- 5. Touch bundle to refresh LaunchServices ---
 
-touch "$HOME/.local/bin/Awake.app"
+touch "$APP_ROOT"
 log "Done. Run: open ~/.local/bin/Awake.app"

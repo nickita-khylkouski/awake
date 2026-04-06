@@ -40,6 +40,7 @@ LOCAL_BIN_DIR="$HOME/.local/bin"
 LOCAL_APP_SRC_DIR="$LOCAL_BIN_DIR/AwakeApp"
 LOCAL_APP_SRC_FILE="$LOCAL_APP_SRC_DIR/main.swift"
 REPO_APP_SRC_FILE="$SCRIPT_DIR/ui/main.swift"
+BASELINE_FILE="$HOME/.config/awake/power-baseline.json"
 PID_FILE="/tmp/awake.pid"
 STATE_FILE="/tmp/awake-state"
 LAST_ACTIVE_FILE="/tmp/awake-last-active"
@@ -54,6 +55,145 @@ log() { echo "$LOG_PREFIX $(date '+%H:%M:%S') $*"; }
 
 now_epoch() { date +%s; }
 
+python_temp_tool() {
+    /usr/bin/python3 - "$@" <<'PY'
+import json
+import re
+import subprocess
+import sys
+import time
+import shutil
+
+args = sys.argv[1:]
+action = args[0] if args else "json"
+
+commands = [
+    ["sudo", "-n", "powermetrics", "--samplers", "thermal,cpu_power", "-n", "1", "-i", "1000"],
+    ["sudo", "-n", "powermetrics", "--samplers", "cpu_power", "-n", "1", "-i", "1000"],
+    ["sudo", "-n", "powermetrics", "--samplers", "smc", "-n", "1", "-i", "1000"],
+]
+
+payload = {
+    "available": False,
+    "value": None,
+    "unit": "C",
+    "sampledAt": int(time.time()),
+    "source": "powermetrics",
+    "label": "CPU temperature",
+    "detail": "CPU via powermetrics",
+    "reason": None,
+}
+smartctl_path = shutil.which("smartctl") or "/opt/homebrew/bin/smartctl"
+
+output = ""
+last_error = ""
+for cmd in commands:
+    try:
+        output = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT, timeout=12)
+        break
+    except subprocess.CalledProcessError as exc:
+        last_error = exc.output.strip() or str(exc)
+    except Exception as exc:
+        last_error = str(exc)
+else:
+    lowered = last_error.lower()
+    if "password is required" in lowered or "superuser" in lowered or "not allowed" in lowered:
+        payload["reason"] = "Needs passwordless sudo for /usr/bin/powermetrics"
+    else:
+        payload["reason"] = last_error or "Unable to read CPU temperature"
+    if action == "json":
+        print(json.dumps(payload))
+    else:
+        print(payload["reason"])
+    raise SystemExit(0)
+
+temps = []
+preferred_patterns = [
+    r"CPU(?:\s+\w+)?\s+die temperature:\s*([0-9]+(?:\.[0-9]+)?)\s*C",
+    r"CPU(?:\s+[A-Za-z0-9_-]+)? temperature:\s*([0-9]+(?:\.[0-9]+)?)\s*C",
+    r"(?:P-CPU|E-CPU)\s+temperature:\s*([0-9]+(?:\.[0-9]+)?)\s*C",
+]
+
+for pattern in preferred_patterns:
+    for match in re.finditer(pattern, output, re.IGNORECASE):
+        temps.append(float(match.group(1)))
+
+if not temps:
+    for line in output.splitlines():
+        lowered = line.lower()
+        if "temperature" not in lowered:
+            continue
+        if "cpu" not in lowered and "die" not in lowered:
+            continue
+        match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*C", line)
+        if match:
+            temps.append(float(match.group(1)))
+
+if not temps:
+    try:
+        scan = subprocess.check_output([smartctl_path, "--scan"], text=True, stderr=subprocess.STDOUT, timeout=10)
+        candidates = []
+        for line in scan.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if " -d nvme" in line:
+                device = line.split(" -d nvme", 1)[0].strip()
+                candidates.append(device)
+        for device in candidates:
+            try:
+                smart_proc = subprocess.run(
+                    [smartctl_path, "-a", "-d", "nvme", device],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=15,
+                    check=False,
+                )
+                smart = smart_proc.stdout or ""
+            except Exception:
+                continue
+            match = re.search(r"^\s*Temperature:\s*([0-9]+(?:\.[0-9]+)?)\s+Celsius\s*$", smart, re.MULTILINE)
+            if match:
+                payload["available"] = True
+                payload["value"] = round(float(match.group(1)), 1)
+                payload["source"] = "nvme-smart"
+                payload["label"] = "SSD temperature"
+                payload["detail"] = "NVMe SMART fallback"
+                payload["reason"] = None
+                break
+        if not payload["available"]:
+            payload["reason"] = "No CPU or NVMe temperature was available"
+    except Exception as exc:
+        payload["reason"] = f"powermetrics did not return a CPU temperature"
+else:
+    payload["available"] = True
+    payload["value"] = round(max(temps), 1)
+
+if action == "json":
+    print(json.dumps(payload))
+elif action == "value":
+    if payload["available"]:
+        print(payload["value"])
+    else:
+        raise SystemExit(payload["reason"] or "unavailable")
+else:
+    raise SystemExit(f"unknown temp action: {action}")
+PY
+}
+
+managed_keys_string() {
+    echo "sleep displaysleep disksleep womp powernap lessbright lidwake acwake"
+}
+
+advanced_keys_string() {
+    echo "ttyskeepawake proximitywake standby autopoweroff hibernatemode"
+}
+
+all_settings_keys_string() {
+    echo "$(managed_keys_string) $(advanced_keys_string)"
+}
+
 copy_if_present() {
     local src="$1"
     local dst="$2"
@@ -67,6 +207,116 @@ copy_if_present() {
 
 notify() {
     osascript -e "display notification \"$2\" with title \"$1\"" 2>/dev/null || true
+}
+
+has_passwordless_pmset() {
+    sudo -n pmset -g >/dev/null 2>&1
+}
+
+has_passwordless_powermetrics() {
+    sudo -n powermetrics -h >/dev/null 2>&1
+}
+
+claude_settings_path() {
+    echo "$HOME/.claude/settings.json"
+}
+
+codex_config_path() {
+    echo "$HOME/.codex/config.toml"
+}
+
+claude_detected() {
+    [ -f "$(claude_settings_path)" ] || command -v claude >/dev/null 2>&1
+}
+
+codex_detected() {
+    [ -d "$HOME/.codex" ] || command -v codex >/dev/null 2>&1
+}
+
+claude_hook_installed() {
+    local settings
+    settings="$(claude_settings_path)"
+    [ -f "$settings" ] || return 1
+    python3 - "$settings" "$LOCAL_BIN_DIR/awake-hook claude" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+command = sys.argv[2]
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except Exception:
+    raise SystemExit(1)
+
+hooks = cfg.get("hooks", {})
+entries = hooks.get("PreToolUse", [])
+for entry in entries:
+    for hook in entry.get("hooks", []):
+        if hook.get("type") == "command" and hook.get("command") == command:
+            print("installed")
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+install_claude_hooks() {
+    local settings
+    settings="$(claude_settings_path)"
+    mkdir -p "$(dirname "$settings")"
+    if [ ! -f "$settings" ]; then
+        printf '{\n  "hooks": {}\n}\n' > "$settings"
+    fi
+    python3 - "$settings" "$LOCAL_BIN_DIR/awake-hook claude" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+command = sys.argv[2]
+with open(path) as f:
+    cfg = json.load(f)
+hooks = cfg.setdefault("hooks", {})
+entries = hooks.setdefault("PreToolUse", [])
+if not any(
+    hook.get("type") == "command" and hook.get("command") == command
+    for entry in entries
+    for hook in entry.get("hooks", [])
+):
+    entries.append({
+        "matcher": "",
+        "hooks": [{"type": "command", "command": command, "timeout": 3}]
+    })
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+PY
+}
+
+codex_notify_installed() {
+    local cfg
+    cfg="$(codex_config_path)"
+    [ -f "$cfg" ] || return 1
+    grep -Fq "notify = \"$LOCAL_BIN_DIR/awake-notify\"" "$cfg"
+}
+
+install_codex_notify() {
+    local cfg
+    cfg="$(codex_config_path)"
+    mkdir -p "$(dirname "$cfg")"
+    touch "$cfg"
+    if ! codex_notify_installed; then
+        printf '\nnotify = "%s"\n' "$LOCAL_BIN_DIR/awake-notify" >> "$cfg"
+    fi
+}
+
+setup_status_json() {
+    printf '{"sleepControlConfigured":%s,"temperatureConfigured":%s,"claudeDetected":%s,"claudeConfigured":%s,"codexDetected":%s,"codexConfigured":%s}\n' \
+        "${HAS_PMSET:-false}" \
+        "${HAS_POWERMETRICS:-false}" \
+        "${HAS_CLAUDE:-false}" \
+        "${HAS_CLAUDE_HOOK:-false}" \
+        "${HAS_CODEX:-false}" \
+        "${HAS_CODEX_NOTIFY:-false}"
 }
 
 get_battery_pct() {
@@ -139,6 +389,266 @@ current_state() {
     cat "$STATE_FILE" 2>/dev/null || echo "unknown"
 }
 
+python_settings_tool() {
+    /usr/bin/python3 - "$BASELINE_FILE" "$@" <<'PY'
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+baseline_path = sys.argv[1]
+args = sys.argv[2:]
+if not args:
+    raise SystemExit("missing action")
+
+action = args[0]
+
+SETTING_DEFS = {
+    "sleep": {"kind": "minutes", "advanced": False},
+    "displaysleep": {"kind": "minutes", "advanced": False},
+    "disksleep": {"kind": "minutes", "advanced": False},
+    "womp": {"kind": "bool", "advanced": False},
+    "powernap": {"kind": "bool", "advanced": False},
+    "lessbright": {"kind": "bool", "advanced": False},
+    "lidwake": {"kind": "bool", "advanced": False},
+    "acwake": {"kind": "bool", "advanced": False},
+    "ttyskeepawake": {"kind": "bool", "advanced": True},
+    "proximitywake": {"kind": "bool", "advanced": True},
+    "standby": {"kind": "bool", "advanced": True},
+    "autopoweroff": {"kind": "bool", "advanced": True},
+    "hibernatemode": {"kind": "enum", "advanced": True, "allowed": {0, 3, 25}},
+}
+OVERRIDE_KEYS = ["sleep", "displaysleep", "standby", "hibernatemode"]
+SOURCES = {"battery": "Battery Power:", "ac": "AC Power:"}
+SOURCE_FLAGS = {"battery": "-b", "ac": "-c"}
+
+
+def run(cmd):
+    return subprocess.check_output(cmd, text=True)
+
+
+def parse_custom():
+    out = run(["pmset", "-g", "custom"])
+    result = {source: {} for source in SOURCES}
+    current = None
+    for raw in out.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        matched = False
+        for source, header in SOURCES.items():
+            if line.strip() == header:
+                current = source
+                matched = True
+                break
+        if matched:
+            continue
+        if current is None:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        key = parts[0]
+        value = parts[-1]
+        if key not in SETTING_DEFS:
+            continue
+        try:
+            result[current][key] = int(value)
+        except ValueError:
+            continue
+    return result
+
+
+def parse_disablesleep():
+    out = run(["pmset", "-g"])
+    match = re.search(r"^\s*disablesleep\s+(\d+)\s*$", out, re.MULTILINE)
+    return int(match.group(1)) if match else 0
+
+
+def load_baseline():
+    if not os.path.exists(baseline_path):
+        return None
+    with open(baseline_path) as f:
+        return json.load(f)
+
+
+def save_baseline(data):
+    os.makedirs(os.path.dirname(baseline_path), exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix="awake-baseline.", dir=os.path.dirname(baseline_path))
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(temp_path, baseline_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def delete_baseline():
+    try:
+        os.unlink(baseline_path)
+    except FileNotFoundError:
+        pass
+
+
+def build_payload():
+    effective = parse_custom()
+    baseline = load_baseline()
+    active = bool(baseline and baseline.get("active"))
+    baseline_sources = baseline["sources"] if active else effective
+    return {
+        "effective": effective,
+        "baseline": baseline_sources,
+        "overrideActive": active,
+        "disablesleep": parse_disablesleep(),
+        "baselineDisablesleep": baseline.get("disablesleep", 0) if active else parse_disablesleep(),
+        "managedKeys": [k for k, meta in SETTING_DEFS.items() if not meta["advanced"]],
+        "advancedKeys": [k for k, meta in SETTING_DEFS.items() if meta["advanced"]],
+        "availableSources": [source for source, values in effective.items() if values],
+    }
+
+
+def coerce_value(key, value):
+    meta = SETTING_DEFS[key]
+    ivalue = int(value)
+    kind = meta["kind"]
+    if kind == "bool" and ivalue not in (0, 1):
+        raise SystemExit(f"{key} expects 0 or 1")
+    if kind == "enum" and ivalue not in meta["allowed"]:
+        raise SystemExit(f"{key} expects one of {sorted(meta['allowed'])}")
+    if kind == "minutes" and ivalue < 0:
+        raise SystemExit(f"{key} expects a non-negative integer")
+    return ivalue
+
+
+def ensure_pairs(items):
+    if len(items) == 0 or len(items) % 2 != 0:
+        raise SystemExit("expected key/value pairs")
+    pairs = []
+    for i in range(0, len(items), 2):
+        key = items[i]
+        if key not in SETTING_DEFS:
+            raise SystemExit(f"unsupported key: {key}")
+        pairs.append((key, coerce_value(key, items[i + 1])))
+    return pairs
+
+
+if action in {"dump", "refresh"}:
+    print(json.dumps(build_payload()))
+elif action == "show":
+    payload = build_payload()
+    print("override active:", "yes" if payload["overrideActive"] else "no")
+    for source in payload["availableSources"]:
+        print(f"{source}:")
+        print("  baseline:")
+        for key in payload["baseline"][source]:
+            print(f"    {key}: {payload['baseline'][source][key]}")
+        print("  effective:")
+        for key in payload["effective"][source]:
+            print(f"    {key}: {payload['effective'][source][key]}")
+elif action == "ensure-baseline":
+    existing = load_baseline()
+    if existing and existing.get("active"):
+        print("existing")
+    else:
+        save_baseline({
+            "version": 1,
+            "active": True,
+            "captured_at": int(time.time()),
+            "disablesleep": parse_disablesleep(),
+            "sources": parse_custom(),
+        })
+        print("captured")
+elif action == "restore-baseline":
+    baseline = load_baseline()
+    if not baseline or not baseline.get("active"):
+        print("missing")
+    else:
+        for source, values in baseline["sources"].items():
+            if not values:
+                continue
+            cmd = ["sudo", "-n", "pmset", SOURCE_FLAGS[source]]
+            for key, value in values.items():
+                if key in SETTING_DEFS:
+                    cmd.extend([key, str(value)])
+            if len(cmd) > 4:
+                subprocess.check_call(cmd)
+        subprocess.check_call(["sudo", "-n", "pmset", "-a", "disablesleep", str(baseline.get("disablesleep", 0))])
+        delete_baseline()
+        print("restored")
+elif action == "baseline-get":
+    source, key = args[1], args[2]
+    payload = build_payload()
+    value = payload["baseline"].get(source, {}).get(key)
+    if value is None:
+        raise SystemExit(1)
+    print(value)
+elif action == "baseline-set":
+    source = args[1]
+    pairs = ensure_pairs(args[2:])
+    baseline = load_baseline()
+    if not baseline:
+        baseline = {
+            "version": 1,
+            "active": False,
+            "captured_at": int(time.time()),
+            "disablesleep": parse_disablesleep(),
+            "sources": parse_custom(),
+        }
+    baseline.setdefault("sources", {}).setdefault(source, {})
+    for key, value in pairs:
+        baseline["sources"][source][key] = value
+    save_baseline(baseline)
+    print("updated")
+elif action == "apply-live":
+    source = args[1]
+    pairs = ensure_pairs(args[2:])
+    if source not in SOURCE_FLAGS:
+        raise SystemExit("source must be battery or ac")
+    cmd = ["sudo", "-n", "pmset", SOURCE_FLAGS[source]]
+    for key, value in pairs:
+        cmd.extend([key, str(value)])
+    subprocess.check_call(cmd)
+    print("applied")
+else:
+    raise SystemExit(f"unknown action: {action}")
+PY
+}
+
+settings_dump_json() {
+    python_settings_tool dump
+}
+
+ensure_baseline_snapshot() {
+    python_settings_tool ensure-baseline >/dev/null
+}
+
+restore_baseline_snapshot() {
+    python_settings_tool restore-baseline >/dev/null 2>&1
+}
+
+baseline_setting_value() {
+    local source="$1"
+    local key="$2"
+    python_settings_tool baseline-get "$source" "$key" 2>/dev/null
+}
+
+settings_apply_live() {
+    local source="$1"
+    shift
+    python_settings_tool apply-live "$source" "$@" >/dev/null
+}
+
+settings_update_baseline() {
+    local source="$1"
+    shift
+    python_settings_tool baseline-set "$source" "$@" >/dev/null
+}
+
 restore_normal_sleep_settings() {
     if [ -f "$CAFFEINE_PID_FILE" ]; then
         kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
@@ -146,7 +656,9 @@ restore_normal_sleep_settings() {
     fi
     # Kill any orphaned caffeinate processes
     pkill -f "caffeinate -[di]" 2>/dev/null || true
-    sudo -n pmset -a disablesleep 0 standby 1 hibernatemode 3 sleep 1 displaysleep 2 2>/dev/null || true
+    if ! restore_baseline_snapshot; then
+        sudo -n pmset -a disablesleep 0 2>/dev/null || true
+    fi
     echo "normal" > "$STATE_FILE"
 }
 
@@ -159,6 +671,7 @@ activate_nosleep() {
         return 0
     fi
     log "Activating nosleep (full)"
+    ensure_baseline_snapshot
     sudo -n pmset -a disablesleep 1 standby 0 hibernatemode 0 sleep 0 displaysleep 0 2>/dev/null || {
         log "ERROR: sudo pmset failed. Run: awake install"
         return 1
@@ -179,10 +692,17 @@ activate_nosleep_display() {
         return 0
     fi
     log "Activating nosleep (display sleep allowed)"
-    sudo -n pmset -a disablesleep 1 standby 0 hibernatemode 0 sleep 0 displaysleep 2 2>/dev/null || {
+    ensure_baseline_snapshot
+    sudo -n pmset -a disablesleep 1 standby 0 hibernatemode 0 sleep 0 2>/dev/null || {
         log "ERROR: sudo pmset failed. Run: awake install"
         return 1
     }
+    local battery_display
+    local ac_display
+    battery_display="$(baseline_setting_value battery displaysleep)"
+    ac_display="$(baseline_setting_value ac displaysleep)"
+    [ -n "$battery_display" ] && sudo -n pmset -b displaysleep "$battery_display" 2>/dev/null || true
+    [ -n "$ac_display" ] && sudo -n pmset -c displaysleep "$ac_display" 2>/dev/null || true
     # Kill tracked + any orphaned caffeinate processes
     if [ -f "$CAFFEINE_PID_FILE" ]; then
         kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
@@ -235,6 +755,96 @@ parse_duration() {
     else
         echo ""
     fi
+}
+
+cmd_settings() {
+    local sub="${1:-show}"
+    shift || true
+
+    case "$sub" in
+        show)
+            python_settings_tool show
+            ;;
+        dump|refresh)
+            settings_dump_json
+            ;;
+        set|apply)
+            local source="${1:-}"
+            shift || true
+            if [ "$source" != "battery" ] && [ "$source" != "ac" ]; then
+                echo "Usage: awake settings $sub <battery|ac> <key> <value> [<key> <value> ...]"
+                return 1
+            fi
+            if [[ "$(current_state)" == nosleep* ]]; then
+                settings_update_baseline "$source" "$@"
+                log "Saved baseline settings for $source (will apply when Awake is off)"
+            else
+                settings_apply_live "$source" "$@"
+                log "Applied baseline settings for $source"
+            fi
+            ;;
+        restore-baseline)
+            restore_normal_sleep_settings
+            ;;
+        *)
+            echo "Usage: awake settings [show|dump|refresh|set|apply|restore-baseline]"
+            return 1
+            ;;
+    esac
+}
+
+cmd_temp() {
+    local sub="${1:-json}"
+    case "$sub" in
+        json|value)
+            python_temp_tool "$sub"
+            ;;
+        *)
+            echo "Usage: awake temp [json|value]"
+            return 1
+            ;;
+    esac
+}
+
+cmd_setup() {
+    local sub="${1:-status-json}"
+    case "$sub" in
+        status|status-json)
+            local has_pmset=false
+            local has_powermetrics=false
+            local has_claude=false
+            local has_claude_hook=false
+            local has_codex=false
+            local has_codex_notify=false
+
+            has_passwordless_pmset && has_pmset=true
+            has_passwordless_powermetrics && has_powermetrics=true
+            claude_detected && has_claude=true
+            claude_hook_installed && has_claude_hook=true
+            codex_detected && has_codex=true
+            codex_notify_installed && has_codex_notify=true
+
+            HAS_PMSET=$has_pmset \
+            HAS_POWERMETRICS=$has_powermetrics \
+            HAS_CLAUDE=$has_claude \
+            HAS_CLAUDE_HOOK=$has_claude_hook \
+            HAS_CODEX=$has_codex \
+            HAS_CODEX_NOTIFY=$has_codex_notify \
+                setup_status_json
+            ;;
+        claude)
+            install_claude_hooks
+            log "Claude Code hooks: installed"
+            ;;
+        codex)
+            install_codex_notify
+            log "Codex notify: installed"
+            ;;
+        *)
+            echo "Usage: awake setup [status-json|claude|codex]"
+            return 1
+            ;;
+    esac
 }
 
 # --- Commands ---
@@ -400,6 +1010,11 @@ cmd_status() {
     else
         echo "sudo pmset:   NOT CONFIGURED"
     fi
+    if sudo -n powermetrics -h >/dev/null 2>&1; then
+        echo "sudo temp:    OK"
+    else
+        echo "sudo temp:    NOT CONFIGURED"
+    fi
 }
 
 cmd_for() {
@@ -500,6 +1115,7 @@ cmd_install() {
     # Bootstrap local files from the current installation source when available.
     copy_if_present "$SCRIPT_DIR/awake" "$LOCAL_BIN_DIR/awake" || true
     copy_if_present "$SCRIPT_DIR/awake-build-ui" "$LOCAL_BIN_DIR/awake-build-ui" || true
+    copy_if_present "$SCRIPT_DIR/awake-build-icon" "$LOCAL_BIN_DIR/awake-build-icon" || true
     copy_if_present "$SCRIPT_DIR/awake-hook" "$LOCAL_BIN_DIR/awake-hook" || true
     copy_if_present "$SCRIPT_DIR/awake-notify" "$LOCAL_BIN_DIR/awake-notify" || true
     if [ -f "$REPO_APP_SRC_FILE" ]; then
@@ -512,11 +1128,17 @@ cmd_install() {
     fi
 
     # 1. Check sudoers
-    if ! sudo -n pmset -g >/dev/null 2>&1; then
+    if ! has_passwordless_pmset; then
         log "WARNING: passwordless sudo not configured"
         log "Run: echo '$USER ALL=(ALL) NOPASSWD: /usr/bin/pmset' | sudo tee /etc/sudoers.d/pmset"
     else
         log "sudoers: OK"
+    fi
+    if ! has_passwordless_powermetrics; then
+        log "WARNING: CPU temperature graph needs passwordless sudo for powermetrics"
+        log "Optional: echo '$USER ALL=(ALL) NOPASSWD: /usr/bin/powermetrics' | sudo tee /etc/sudoers.d/powermetrics"
+    else
+        log "powermetrics: OK"
     fi
 
     # 2. Check helper scripts
@@ -560,37 +1182,23 @@ CONF
     fi
 
     # 5. Patch Claude Code settings.json
-    local settings="$HOME/.claude/settings.json"
+    local settings
+    settings="$(claude_settings_path)"
     if [ -f "$settings" ]; then
-        python3 -c "
-import json
-with open('$settings') as f:
-    cfg = json.load(f)
-hooks = cfg.setdefault('hooks', {})
-entries = hooks.setdefault('PreToolUse', [])
-if not any('awake-hook' in str(h) for h in entries):
-    entries.append({
-        'matcher': '',
-            'hooks': [{'type': 'command', 'command': '$LOCAL_BIN_DIR/awake-hook claude', 'timeout': 3}]
-    })
-with open('$settings', 'w') as f:
-    json.dump(cfg, f, indent=2)
-    f.write('\n')
-print('OK')
-"
+        install_claude_hooks
         log "Claude Code hooks: installed"
     else
         log "WARNING: $settings not found"
     fi
 
     # 5. Patch Codex config
-    local codex_cfg="$HOME/.codex/config.toml"
+    local codex_cfg
+    codex_cfg="$(codex_config_path)"
     if [ -d "$HOME/.codex" ]; then
-        if grep -q "awake-notify" "$codex_cfg" 2>/dev/null; then
+        if codex_notify_installed; then
             log "Codex notify: already configured"
         else
-            echo "" >> "$codex_cfg"
-            echo "notify = \"$LOCAL_BIN_DIR/awake-notify\"" >> "$codex_cfg"
+            install_codex_notify
             log "Codex notify: installed"
         fi
     else
@@ -648,6 +1256,9 @@ case "${1:-}" in
     uninstall)  cmd_uninstall ;;
     _daemon)    cmd_daemon ;;
     "")         cmd_daemon_start ;;
-    *)          echo "Usage: awake [start|stop|sleep|nosleep|nosleep-display|yessleep|status|for <dur>|run <cmd>|ui|install|uninstall]"
+    settings)   shift; cmd_settings "$@" ;;
+    setup)      shift; cmd_setup "$@" ;;
+    temp)       shift; cmd_temp "$@" ;;
+    *)          echo "Usage: awake [start|stop|sleep|nosleep|nosleep-display|yessleep|status|for <dur>|run <cmd>|ui|install|uninstall|settings ...|setup ...|temp [json|value]]"
                 exit 1 ;;
 esac

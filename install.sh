@@ -3,5 +3,5 @@
 set -euo pipefail
 
 cd -- "$(dirname -- "$0")"
-chmod +x awake awake-build-ui awake-hook awake-notify
+chmod +x awake awake-build-ui awake-build-icon awake-hook awake-notify
 ./awake install
