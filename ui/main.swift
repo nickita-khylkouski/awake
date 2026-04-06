@@ -2460,7 +2460,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             timerMenu.addItem(NSMenuItem.separator())
             timerMenu.addItem(NSMenuItem(title: "Cancel Timer", action: #selector(menuTimerCancel), keyEquivalent: ""))
         }
-        let timerParent = NSMenuItem(title: "Timer", action: nil, keyEquivalent: "")
+        let timerParent = NSMenuItem(title: "Sleep in", action: nil, keyEquivalent: "")
         timerParent.submenu = timerMenu
         menu.addItem(timerParent)
 
