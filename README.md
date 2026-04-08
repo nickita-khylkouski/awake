@@ -2,6 +2,12 @@
 
 > Agent-aware keep-awake for macOS.
 
+[![MIT License](https://img.shields.io/badge/license-MIT-black)](./LICENSE)
+![macOS](https://img.shields.io/badge/platform-macOS%2013%2B-0f172a)
+![Bash + SwiftUI](https://img.shields.io/badge/stack-Bash%20%2B%20SwiftUI-14532d)
+
+![awake hero](./assets/awake-hero.svg)
+
 `awake` keeps your Mac alive while coding agents are actually working. It prevents idle sleep and lid-close sleep, restores your normal power settings when work stops, and gives you a native menu bar app plus a CLI for manual control.
 
 Unlike generic keep-awake tools, `awake` is built around long-running AI coding sessions. It can watch for Claude Code, Codex, Aider, Copilot, Amp, and similar tools, activate automatically, respect timers and manual sessions, and fail back to normal sleep cleanly.
@@ -62,6 +68,15 @@ When you run AI coding agents (Claude Code, Codex CLI, Aider, etc.) on a laptop,
 - Codex notify support
 - Process detection for named agent binaries
 - Shared runtime state between CLI and UI
+
+## Why it feels different
+
+Most keep-awake apps are generic toggles. `awake` is opinionated:
+
+- It assumes long-running agent workflows are the main job
+- It treats automatic restore as part of the product, not cleanup trivia
+- It gives you both a native panel and scriptable CLI control
+- It keeps the product narrow instead of turning into a giant menu bar toolbox
 
 ## How it works
 
@@ -465,6 +480,16 @@ Install a fresh local build into `~/.local/bin`:
 ./awake install
 open ~/.local/bin/Awake.app
 ```
+
+## Contributing
+
+If you want to contribute, start with [CONTRIBUTING.md](./CONTRIBUTING.md).
+
+Useful issue types:
+- daemon/runtime bugs
+- menu bar app UX issues
+- agent integration gaps
+- install/setup edge cases
 
 ## Requirements
 
