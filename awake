@@ -13,7 +13,7 @@ POLL_INTERVAL=15
 GRACE_SECONDS=300       # 5 minutes
 BATTERY_CRITICAL=5      # force sleep even if agents running
 BATTERY_WARN=15         # send notification
-MODE_DEFAULT="agent-safe"
+MODE_DEFAULT="running"
 
 # --- Load config ---
 

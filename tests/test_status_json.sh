@@ -94,7 +94,7 @@ rm -rf /tmp/awake-leases /tmp/awake-daemon.lock
 rm -f /tmp/awake-state /tmp/awake-last-active /tmp/awake-caffeinate.pid /tmp/awake-for.pid /tmp/awake-for-end /tmp/awake-for-token /tmp/awake-why
 
 json="$("$REPO_DIR/awake" status --json)"
-[[ "$json" == *'"defaultMode":"agent-safe"'* ]]
+[[ "$json" == *'"defaultMode":"running"'* ]]
 [[ "$json" == *'"leases":['* ]]
 [[ "$json" == *'"rules":['* ]]
 [[ "$json" == *'"warnings":['* ]]

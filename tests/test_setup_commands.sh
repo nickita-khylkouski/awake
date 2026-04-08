@@ -60,7 +60,7 @@ status_json="$("$REPO_DIR/awake" setup status-json)"
 [[ "$status_json" == *'"claudeConfigured":false'* ]]
 [[ "$status_json" == *'"codexDetected":true'* ]]
 [[ "$status_json" == *'"codexConfigured":false'* ]]
-[[ "$status_json" == *'"defaultMode":"agent-safe"'* ]]
+[[ "$status_json" == *'"defaultMode":"running"'* ]]
 [[ "$status_json" == *'"leases":['* ]]
 [[ "$status_json" == *'"rules":['* ]]
 [[ "$status_json" == *'"whyAwake":"Normal sleep. No active leases."'* ]]

@@ -632,7 +632,7 @@ class AwakeViewModel: ObservableObject {
     @Published var codexDetected: Bool = false
     @Published var codexConfigured: Bool = false
     @Published var showOnboarding: Bool = false
-    @Published var defaultMode: String = "agent-safe"
+    @Published var defaultMode: String = "running"
     @Published var effectiveMode: String = ""
     @Published var effectiveResolvedMode: String = ""
     @Published var effectiveReason: String = ""
@@ -1406,7 +1406,7 @@ struct TemperatureSparkline: View {
                             .frame(width: 9, height: 9)
                             .position(hovered.point)
 
-                        hoverBadge(for: hovered.sample, size: geo.size, x: hovered.point.x)
+                        hoverBadge(for: hovered.sample, point: hovered.point, size: geo.size)
                     } else {
                         Circle()
                             .fill(Color.white)
@@ -1433,8 +1433,17 @@ struct TemperatureSparkline: View {
     }
 
     @ViewBuilder
-    private func hoverBadge(for sample: CPUTemperaturePoint, size: CGSize, x: CGFloat) -> some View {
-        let anchorX = min(max(x, 72), max(size.width - 72, 72))
+    private func hoverBadge(for sample: CPUTemperaturePoint, point: CGPoint, size: CGSize) -> some View {
+        let badgeWidth: CGFloat = 86
+        let horizontalOffset: CGFloat = 56
+        let verticalOffset: CGFloat = 26
+        let placeRight = point.x <= (size.width - badgeWidth - 24)
+        let placeAbove = point.y >= 26
+        let rawX = point.x + (placeRight ? horizontalOffset : -horizontalOffset)
+        let rawY = point.y + (placeAbove ? -verticalOffset : verticalOffset)
+        let anchorX = min(max(rawX, badgeWidth / 2), max(size.width - (badgeWidth / 2), badgeWidth / 2))
+        let anchorY = min(max(rawY, 18), max(size.height - 18, 18))
+
         VStack(alignment: .leading, spacing: 2) {
             Text(hoverTimeString(sample.timestamp))
                 .font(.system(size: 9, weight: .semibold, design: .monospaced))
@@ -1453,7 +1462,7 @@ struct TemperatureSparkline: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(Color.primary.opacity(0.08), lineWidth: 1)
         )
-        .position(x: anchorX, y: 14)
+        .position(x: anchorX, y: anchorY)
     }
 
     private func hoverTimeString(_ timestamp: TimeInterval) -> String {
@@ -1535,7 +1544,9 @@ struct TagBadge: View {
 
 struct ContentView: View {
     @StateObject private var vm = AwakeViewModel()
+    @State private var showSettings = false
     @State private var showAdvancedSettings = false
+    @State private var showPowerSettings = false
 
     var body: some View {
         Group {
@@ -1994,31 +2005,8 @@ struct ContentView: View {
             }
 
             HStack(spacing: 6) {
-                Text("Mode")
-                    .font(.system(size: 12, weight: .medium))
-                InfoPopoverButton(text: "Default wake mode for daemon sessions, timers, and `awake run` commands.\n\nAgent Safe chooses the safer default automatically: it becomes Keep Presenting when display sleep is not allowed, and Keep Running when display sleep is allowed.\n\nKeep Running keeps the Mac awake while still allowing the display to sleep. Keep Presenting keeps both the Mac and the display awake.")
-
-                Picker("", selection: Binding(
-                    get: { vm.defaultMode },
-                    set: { vm.setDefaultMode($0) }
-                )) {
-                    Text("Agent Safe").tag("agent-safe")
-                    Text("Keep Running").tag("running")
-                    Text("Keep Presenting").tag("presenting")
-                }
-                .labelsHidden()
-                .frame(width: 170)
-
-                Spacer()
-            }
-
-            Text("Default mode for daemon, timers, and command sessions.")
-                .font(.system(size: 10))
-                .foregroundColor(.secondary)
-
-            HStack(spacing: 6) {
                 Text("Sleep in")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 13, weight: .semibold))
 
                 Picker("", selection: $vm.selectedDuration) {
                     ForEach(DurationOption.allCases, id: \.self) { opt in
@@ -2070,6 +2058,31 @@ struct ContentView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.regular)
+
+            Divider()
+
+            HStack(spacing: 6) {
+                Text("Default mode")
+                    .font(.system(size: 12, weight: .medium))
+                InfoPopoverButton(text: "Used for daemon sessions, timers, and `awake run` commands.\n\nKeep Running is the default because it keeps the Mac awake without forcing the display to stay on.\n\nAgent Safe chooses automatically based on display-sleep settings. Keep Presenting keeps both the Mac and the display awake.")
+
+                Picker("", selection: Binding(
+                    get: { vm.defaultMode },
+                    set: { vm.setDefaultMode($0) }
+                )) {
+                    Text("Keep Running").tag("running")
+                    Text("Agent Safe").tag("agent-safe")
+                    Text("Keep Presenting").tag("presenting")
+                }
+                .labelsHidden()
+                .frame(width: 170)
+
+                Spacer()
+            }
+
+            Text("Applies when Awake starts automatically or through timers and commands.")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
         }
     }
 
@@ -2077,121 +2090,140 @@ struct ContentView: View {
 
     private var settingsSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            SectionLabel(
-                text: "Settings",
-                help: "Persistent settings for how your Mac behaves when Awake is not actively overriding sleep.\n\nExample: set `Display sleep after` to 5m here, then Awake can temporarily ignore that while an agent is running."
-            )
-
-            Toggle(isOn: Binding(
-                get: { vm.allowDisplaySleep },
-                set: { _ in vm.toggleDisplaySleep() }
-            )) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Allow display sleep")
-                        .font(.system(size: 12))
-                    Text("Screen off, system stays awake")
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                }
-            }
-            .toggleStyle(.switch)
-            .tint(.green)
-
-            Toggle(isOn: Binding(
-                get: { vm.launchAgentInstalled },
-                set: { _ in vm.toggleLaunchAgent() }
-            )) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Start at login")
-                        .font(.system(size: 12))
-                    Text("Auto-start daemon on login")
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                }
-            }
-            .toggleStyle(.switch)
-            .tint(.green)
-
-            HStack {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Dock icon")
-                        .font(.system(size: 12))
-                    Text("Always visible so Awake stays easy to reopen")
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                }
-                Spacer()
-                TagBadge(text: "always on", color: .green)
-            }
-
-            Button("Open setup guide") {
-                vm.reopenOnboarding()
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-
-            Button("Move top icon forward") {
-                vm.promoteMenuBarIcon()
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-
-            Divider()
-
-            HStack {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Power settings")
-                        .font(.system(size: 12))
-                    Text(vm.awakeOverrideActive
-                        ? "Editing baseline while Awake override is active"
-                        : "Baseline sleep behavior for this Mac")
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                }
-                Spacer()
-                if vm.awakeOverrideActive {
-                    TagBadge(text: "override", color: .orange)
-                }
-                InfoPopoverButton(text: "These are your baseline Mac sleep settings.\n\nExample: if `System sleep after` is 15m and Awake is inactive, macOS will sleep normally after 15 minutes. If Awake is active, Awake temporarily overpowers that until it turns off.\n\nLike macOS System Settings, changes here apply immediately.")
-            }
-
-            if !vm.availableSettingsSources.isEmpty {
-                Picker("", selection: $vm.selectedSettingsSource) {
-                    ForEach(vm.availableSettingsSources) { source in
-                        Text(source.title).tag(source)
-                    }
-                }
-                .pickerStyle(.segmented)
-
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(sleepSettingDefinitions.filter { !$0.isAdvanced }) { setting in
-                        settingRow(setting)
-                    }
-                }
-
-                DisclosureGroup(isExpanded: $showAdvancedSettings) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        ForEach(sleepSettingDefinitions.filter(\.isAdvanced)) { setting in
-                            settingRow(setting)
+            DisclosureGroup(isExpanded: $showSettings) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle(isOn: Binding(
+                        get: { vm.allowDisplaySleep },
+                        set: { _ in vm.toggleDisplaySleep() }
+                    )) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Allow display sleep")
+                                .font(.system(size: 12))
+                            Text("Screen off, system stays awake")
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
                         }
                     }
-                    .padding(.top, 6)
-                } label: {
-                    Text("Advanced")
-                        .font(.system(size: 12, weight: .medium))
-                }
+                    .toggleStyle(.switch)
+                    .tint(.green)
 
-                if vm.awakeOverrideActive {
-                    Text("Awake is currently overriding live sleep behavior. Changes here update the baseline immediately and will be restored when Awake turns off.")
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                } else {
-                    Text("Changes apply immediately, like macOS System Settings.")
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    Toggle(isOn: Binding(
+                        get: { vm.launchAgentInstalled },
+                        set: { _ in vm.toggleLaunchAgent() }
+                    )) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Start at login")
+                                .font(.system(size: 12))
+                            Text("Auto-start daemon on login")
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .tint(.green)
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Dock icon")
+                            .font(.system(size: 12))
+                        Text("Always visible so Awake stays easy to reopen")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .overlay(alignment: .trailing) {
+                        TagBadge(text: "always on", color: .green)
+                    }
+
+                    Button("Open setup guide") {
+                        vm.reopenOnboarding()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Button("Move top icon forward") {
+                        vm.promoteMenuBarIcon()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Divider()
+
+                    DisclosureGroup(isExpanded: $showPowerSettings) {
+                        if !vm.availableSettingsSources.isEmpty {
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack(spacing: 8) {
+                                    Text("Source")
+                                        .font(.system(size: 12, weight: .medium))
+
+                                    Picker("", selection: $vm.selectedSettingsSource) {
+                                        ForEach(vm.availableSettingsSources) { source in
+                                            Text(source.title).tag(source)
+                                        }
+                                    }
+                                    .pickerStyle(.menu)
+                                    .labelsHidden()
+                                    .frame(width: 170, alignment: .leading)
+
+                                    Spacer()
+                                }
+
+                                VStack(alignment: .leading, spacing: 8) {
+                                    ForEach(sleepSettingDefinitions.filter { !$0.isAdvanced }) { setting in
+                                        settingRow(setting)
+                                    }
+                                }
+
+                                DisclosureGroup(isExpanded: $showAdvancedSettings) {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        ForEach(sleepSettingDefinitions.filter(\.isAdvanced)) { setting in
+                                            settingRow(setting)
+                                        }
+                                    }
+                                    .padding(.top, 6)
+                                } label: {
+                                    Text("Advanced")
+                                        .font(.system(size: 12, weight: .medium))
+                                }
+
+                                if vm.awakeOverrideActive {
+                                    Text("Awake is currently overriding live sleep behavior. Changes here update the baseline immediately and will be restored when Awake turns off.")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                } else {
+                                    Text("Changes apply immediately, like macOS System Settings.")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                            .padding(.top, 8)
+                        }
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("Power settings")
+                                    .font(.system(size: 12))
+                                Text(vm.awakeOverrideActive
+                                    ? "Editing baseline while Awake override is active"
+                                    : "Baseline sleep behavior for this Mac")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            if vm.awakeOverrideActive {
+                                TagBadge(text: "override", color: .orange)
+                            }
+                            InfoPopoverButton(text: "These are your baseline Mac sleep settings.\n\nExample: if `System sleep after` is 15m and Awake is inactive, macOS will sleep normally after 15 minutes. If Awake is active, Awake temporarily overpowers that until it turns off.\n\nLike macOS System Settings, changes here apply immediately.")
+                        }
+                    }
                 }
+                .padding(.top, 8)
+            } label: {
+                SectionLabel(
+                    text: "Settings",
+                    help: "Persistent settings for how your Mac behaves when Awake is not actively overriding sleep.\n\nExample: set `Display sleep after` to 5m here, then Awake can temporarily ignore that while an agent is running."
+                )
             }
         }
     }
@@ -2319,13 +2351,16 @@ struct ContentView: View {
     private func settingControl(for setting: SettingDefinition) -> some View {
         switch setting.kind {
         case .boolean:
-            Toggle("", isOn: Binding(
-                get: { vm.valueForSelectedSource(setting.key) != 0 },
-                set: { vm.updatePowerSetting(setting.key, $0 ? 1 : 0) }
-            ))
+            Picker("", selection: Binding(
+                get: { vm.valueForSelectedSource(setting.key) },
+                set: { vm.updatePowerSetting(setting.key, $0) }
+            )) {
+                Text("Off").tag(0)
+                Text("On").tag(1)
+            }
+            .pickerStyle(.menu)
             .labelsHidden()
-            .toggleStyle(.switch)
-            .tint(.green)
+            .frame(width: 92)
             .disabled(vm.isApplyingSetting(setting.key))
 
         case .minutes(let options):
@@ -2337,6 +2372,7 @@ struct ContentView: View {
                     Text(formatMinutes(value)).tag(value)
                 }
             }
+            .pickerStyle(.menu)
             .labelsHidden()
             .frame(width: 110)
             .disabled(vm.isApplyingSetting(setting.key))
@@ -2350,6 +2386,7 @@ struct ContentView: View {
                     Text("\(value)").tag(value)
                 }
             }
+            .pickerStyle(.menu)
             .labelsHidden()
             .frame(width: 90)
             .disabled(vm.isApplyingSetting(setting.key))

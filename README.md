@@ -1,14 +1,67 @@
 # awake
 
-Keep your Mac alive while AI coding agents run. Prevents sleep — including lid-close sleep — as long as agents like Claude Code, Codex, Aider, Copilot, or Amp are detected.
+> Agent-aware keep-awake for macOS.
 
-Unlike other keep-awake tools (Amphetamine, KeepingYouAwake, Caffeine), `awake` is **agent-aware**: it automatically activates when coding agents are detected and goes back to normal sleep after a configurable grace period when they stop.
+`awake` keeps your Mac alive while coding agents are actually working. It prevents idle sleep and lid-close sleep, restores your normal power settings when work stops, and gives you a native menu bar app plus a CLI for manual control.
+
+Unlike generic keep-awake tools, `awake` is built around long-running AI coding sessions. It can watch for Claude Code, Codex, Aider, Copilot, Amp, and similar tools, activate automatically, respect timers and manual sessions, and fail back to normal sleep cleanly.
+
+## Highlights
+
+- Agent-aware daemon with process and hook-based detection
+- Lid-close prevention via `pmset disablesleep 1`
+- Native macOS menu bar app with panel, graph, logs, and setup flow
+- Manual sessions, timers, and `awake run <cmd>` command-scoped protection
+- Battery protection and automatic restore behavior
+- Hook wiring for Claude Code and Codex
+- Open source, scriptable, and local-first
+
+## Quick start
+
+```bash
+git clone https://github.com/nickita-khylkouski/awake.git
+cd awake
+./install.sh
+awake start
+open ~/.local/bin/Awake.app
+```
+
+If `awake install` warns about `pmset`, set up passwordless sudo:
+
+```bash
+sudo bash -c 'echo "$(whoami) ALL=(ALL) NOPASSWD: /usr/bin/pmset" > /etc/sudoers.d/pmset'
+sudo chmod 440 /etc/sudoers.d/pmset
+sudo -n pmset -g
+```
 
 ## Why this exists
 
 When you run AI coding agents (Claude Code, Codex CLI, Aider, etc.) on a laptop, they need the machine to stay awake — sometimes for hours. Close the lid to grab coffee, and your agent dies mid-task. macOS energy settings can prevent idle sleep, but **nothing in System Settings prevents lid-close sleep**. The only way is `sudo pmset disablesleep 1`, and you need something to manage that automatically.
 
 `awake` watches for running agents, activates lid-close prevention when they're detected, handles battery protection so your laptop doesn't die, and cleans up when agents stop.
+
+## What you get
+
+### CLI
+
+- `awake start` / `awake stop` for daemon control
+- `awake nosleep`, `awake yessleep`, and timed sessions like `awake for 2h`
+- `awake run <cmd>` to keep the Mac awake only while one command runs
+- `awake status`, `awake why`, and `awake doctor` for inspection and debugging
+
+### Menu bar app
+
+- Left-click toggles Awake on or off
+- Right-click opens the full panel
+- Panel includes hero state, timers, daemon controls, logs, rules, and setup guidance
+- Settings and power controls are available directly in the app
+
+### Agent integrations
+
+- Claude Code heartbeat hook support
+- Codex notify support
+- Process detection for named agent binaries
+- Shared runtime state between CLI and UI
 
 ## How it works
 
@@ -72,12 +125,12 @@ Before installing, you need:
 
 ## Install
 
-`awake` now supports two install paths:
+`awake` supports two install paths:
 
-- Source install: best if you're hacking on the repo
-- npm install: best if you want the CLI to bootstrap the local menubar app for you
+- Source install: best if you want the repo locally
+- npm install: best if you want the CLI to bootstrap the app for you
 
-Both end up building the same native `Awake.app` menubar app in `~/.local/bin/Awake.app`.
+Both produce the same native app bundle at `~/.local/bin/Awake.app`.
 
 ### Step 1: Clone the repo
 
@@ -209,19 +262,20 @@ awake uninstall          # Remove hooks, clean up
 
 The SwiftUI menu bar app shows an icon in your menu bar:
 
-- **Green bolt icon** (`⚡ 2h`) — nosleep is active, showing how long
-- **Moon icon** — normal sleep mode
+- Green bolt icon when Awake is actively holding sleep off
+- Moon icon when the Mac is in normal sleep mode
 
-**Interactions:**
-- **Left-click** → toggles Awake on/off
-- **Right-click** → opens the main panel
+Interactions:
+- Left-click toggles Awake on or off
+- Right-click opens the main panel
+- `Ctrl+Shift+A` opens the panel directly
 
-**Panel** (toggle with `Ctrl+Shift+A` or right-click on the menu bar icon):
-- Full dashboard with hero status, pulsing animation when active
+The panel includes:
+- Hero state with the current effective wake mode
 - Agent and hook monitoring
-- All controls: nosleep toggle, timer, daemon start/stop, sleep now
-- Settings: display sleep toggle, start at login toggle
-- Live scrolling log of all state changes
+- Timers, daemon controls, sleep-now actions, and logs
+- Collapsible settings and power controls
+- Temperature history and diagnostics
 
 ## Configuration
 
@@ -385,6 +439,32 @@ Works fine — battery monitoring is skipped, the app shows "AC (desktop)" inste
 | Open source | yes | no | yes | no |
 | Menu bar app | yes | yes | yes | yes |
 | Process-based triggers | yes (agents) | yes (any app) | no | no |
+
+`awake` is not trying to be a giant utility belt. The product direction is narrower: be the best keep-awake tool for people running agentic coding workflows on a Mac.
+
+## Development
+
+Useful local checks:
+
+```bash
+npm run verify:shell
+bash tests/test_setup_commands.sh
+bash tests/test_timer_behavior.sh
+bash tests/test_leases.sh
+bash tests/test_modes.sh
+bash tests/test_rules.sh
+bash tests/test_status_json.sh
+bash tests/test_build_ui.sh
+bash tests/test_install_flow.sh
+swiftc -typecheck ui/main.swift
+```
+
+Install a fresh local build into `~/.local/bin`:
+
+```bash
+./awake install
+open ~/.local/bin/Awake.app
+```
 
 ## Requirements
 
