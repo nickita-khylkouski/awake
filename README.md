@@ -53,6 +53,38 @@ That one command installs the CLI, builds the native menu bar app into `~/.local
 
 If you want the repo/development workflow instead, use the install steps below.
 
+## Updating
+
+If you installed with `npx`, update in one command:
+
+```bash
+npx --yes awake-agent@latest install
+```
+
+If you installed globally with npm:
+
+```bash
+npm install -g awake-agent@latest
+awake install
+```
+
+Inside the app, Awake can also:
+
+- check npm for a newer published version in the background
+- show an `Update available` banner for self-updatable installs (`npx` and `npm -g`)
+- run a one-click self-update for `npx` and `npm -g` installs
+
+If you installed from the repo:
+
+```bash
+git pull
+awake install
+```
+
+Repo installs still show version/update state in Settings, but they do not use the one-click self-update path.
+
+For the release/update architecture decision, including why Sparkle is deferred for now, see [docs/update-architecture.md](./docs/update-architecture.md).
+
 If `awake install` warns about `pmset`, set up passwordless sudo:
 
 ```bash

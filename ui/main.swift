@@ -38,6 +38,7 @@ let CPU_TEMP_HISTORY_WINDOW: TimeInterval = 12 * 60 * 60
 let CPU_TEMP_SAMPLE_INTERVAL: TimeInterval = 60
 let ONBOARDING_STATE_PATH = NSString("~/.config/awake/onboarding-completed.json").expandingTildeInPath
 let ONBOARDING_VERSION = 2
+let AWAKE_REPO_URL = "https://github.com/nickita-khylkouski/awake"
 
 let AGENTS: [String] = {
     if let env = ProcessInfo.processInfo.environment["AWAKE_AGENTS"] {
@@ -191,6 +192,22 @@ struct SetupSnapshot: Decodable {
     let leases: [LeaseSnapshot]?
     let rules: [RuleSnapshot]?
     let warnings: [String]?
+}
+
+struct UpdateSnapshot: Decodable {
+    let packageName: String
+    let currentVersion: String
+    let appVersion: String
+    let latestVersion: String?
+    let updateAvailable: Bool
+    let installSource: String
+    let installSourceDetail: String
+    let canSelfUpdate: Bool
+    let checkedAt: TimeInterval?
+    let cached: Bool
+    let error: String?
+    let releaseURL: String
+    let source: String
 }
 
 struct LeaseSnapshot: Decodable, Identifiable {
@@ -611,6 +628,32 @@ func formatModeLabel(_ mode: String) -> String {
     }
 }
 
+func installSourceLabel(_ source: String) -> String {
+    switch source {
+    case "npx": return "npx"
+    case "npm-global": return "npm -g"
+    case "repo": return "repo install"
+    case "local-copy": return "local install"
+    default: return source
+    }
+}
+
+func currentBundleAppVersion() -> String {
+    if let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+       !short.isEmpty {
+        return short
+    }
+    return "unknown"
+}
+
+func currentBundleAppURL() -> URL {
+    let bundleURL = Bundle.main.bundleURL
+    if bundleURL.pathExtension == "app" {
+        return bundleURL
+    }
+    return URL(fileURLWithPath: NSString("~/.local/bin/Awake.app").expandingTildeInPath)
+}
+
 func truncateForMenu(_ value: String, limit: Int = 90) -> String {
     guard value.count > limit else { return value }
     return String(value.prefix(limit - 1)) + "…"
@@ -675,13 +718,28 @@ class AwakeViewModel: ObservableObject {
     @Published var activeLeases: [LeaseSnapshot] = []
     @Published var configuredRules: [RuleSnapshot] = []
     @Published var warnings: [String] = []
+    @Published var appVersion: String = currentBundleAppVersion()
+    @Published var cliVersion: String = "unknown"
+    @Published var latestVersion: String = ""
+    @Published var updateAvailable: Bool = false
+    @Published var canSelfUpdate: Bool = false
+    @Published var updateInstallSource: String = ""
+    @Published var updateCheckedAt: Date?
+    @Published var updateCachedResult: Bool = false
+    @Published var updateErrorText: String = ""
+    @Published var updateReleaseURL: String = "https://github.com/nickita-khylkouski/awake/releases/latest"
+    @Published var updateChecking: Bool = false
+    @Published var updateInFlight: Bool = false
 
     private var prevState: [String: String] = [:]
     private var timer: AnyCancellable?
     private var isFirstRefresh = true
     private let powerMonitor = PowerMonitor()
     private var lastTempFetchAt: Date?
+    private var lastUpdateFetchAt: Date?
+    private var lastUpdateFailureAt: Date?
     private var tempFetchInFlight = false
+    private var updateFetchInFlight = false
     private var onboardingEvaluated = false
 
     var onStateChange: ((String) -> Void)?
@@ -745,6 +803,7 @@ class AwakeViewModel: ObservableObject {
 
     func refreshAsync() {
         maybeRefreshCpuTemperature()
+        maybeRefreshUpdateStatus()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self = self else { return }
             let state = readFile(STATE_FILE) ?? "unknown"
@@ -799,6 +858,44 @@ class AwakeViewModel: ObservableObject {
                     return
                 }
                 self.applyCpuTemperaturePayload(payload)
+            }
+        }
+    }
+
+    private func maybeRefreshUpdateStatus(force: Bool = false) {
+        if updateFetchInFlight { return }
+        if !force, let last = lastUpdateFetchAt, Date().timeIntervalSince(last) < (15 * 60) {
+            return
+        }
+        if !force, let failure = lastUpdateFailureAt, Date().timeIntervalSince(failure) < 60 {
+            return
+        }
+
+        updateFetchInFlight = true
+        updateChecking = true
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let args = force ? ["update", "status", "--refresh", "--json"] : ["update", "status", "--json"]
+            let (ok, output, err) = runCommandCapture(AWAKE_CMD, args, timeout: 15)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.updateFetchInFlight = false
+                self.updateChecking = false
+                guard ok, let data = output.data(using: .utf8),
+                      let payload = try? JSONDecoder().decode(UpdateSnapshot.self, from: data) else {
+                    self.lastUpdateFailureAt = Date()
+                    self.updateAvailable = false
+                    self.canSelfUpdate = false
+                    self.latestVersion = self.cliVersion
+                    self.updateInstallSource = ""
+                    self.updateCheckedAt = nil
+                    self.updateCachedResult = false
+                    self.updateErrorText = err.isEmpty ? "Unable to check for updates" : err
+                    return
+                }
+                self.lastUpdateFetchAt = Date()
+                self.lastUpdateFailureAt = nil
+                self.applyUpdateSnapshot(payload)
             }
         }
     }
@@ -1135,8 +1232,96 @@ class AwakeViewModel: ObservableObject {
         }
     }
 
+    private func applyUpdateSnapshot(_ snapshot: UpdateSnapshot) {
+        cliVersion = snapshot.currentVersion
+        latestVersion = snapshot.latestVersion ?? snapshot.currentVersion
+        updateAvailable = snapshot.updateAvailable
+        canSelfUpdate = snapshot.canSelfUpdate
+        updateInstallSource = snapshot.installSource
+        updateCheckedAt = snapshot.checkedAt.map { Date(timeIntervalSince1970: $0) }
+        updateCachedResult = snapshot.cached
+        updateErrorText = snapshot.error ?? ""
+        updateReleaseURL = snapshot.releaseURL
+    }
+
     func setDefaultMode(_ mode: String) {
         runAction("Setting mode to \(formatModeLabel(mode))", AWAKE_CMD, ["mode", "set", mode])
+    }
+
+    func checkForUpdatesNow() {
+        addLog("Checking for Awake updates...")
+        maybeRefreshUpdateStatus(force: true)
+    }
+
+    func openLatestReleasePage() {
+        guard let url = URL(string: updateReleaseURL) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    func openRepoPage() {
+        guard let url = URL(string: AWAKE_REPO_URL) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    var updateStatusSummary: String {
+        if !updateErrorText.isEmpty {
+            return "Check failed"
+        }
+        if updateAvailable {
+            return "Awake \(latestVersion) available"
+        }
+        if updateCheckedAt != nil {
+            return "Up to date"
+        }
+        return "Not checked yet"
+    }
+
+    var manualUpdateHint: String? {
+        switch updateInstallSource {
+        case "repo":
+            return "Update your Awake checkout, then run `awake install`."
+        case "local-copy":
+            return "This copy cannot self-update. Reinstall from the latest npm package or GitHub release."
+        default:
+            return nil
+        }
+    }
+
+    func applyUpdate() {
+        guard !updateInFlight, canSelfUpdate else { return }
+        updateInFlight = true
+        isBusy = true
+        busySince = Date()
+        addLog("Updating Awake to latest published version...")
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let (ok, out, err) = runCommandCapture(AWAKE_CMD, ["update", "apply"], timeout: 240)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.updateInFlight = false
+                self.isBusy = false
+                self.busySince = nil
+                if ok {
+                    self.addLog("Awake updated. Reopening app…", color: .green)
+                    self.maybeRefreshUpdateStatus(force: true)
+                    let appURL = currentBundleAppURL()
+                    let configuration = NSWorkspace.OpenConfiguration()
+                    configuration.createsNewApplicationInstance = true
+                    NSWorkspace.shared.openApplication(at: appURL, configuration: configuration) { app, error in
+                        if app != nil && error == nil {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                                NSApp.terminate(nil)
+                            }
+                        } else {
+                            self.addLog("Updated, but could not reopen \(appURL.path)", color: .orange)
+                        }
+                    }
+                } else {
+                    let message = err.isEmpty ? out : err
+                    self.addLog("Awake update failed: \(message.prefix(160))", color: .red)
+                }
+            }
+        }
     }
 
     var needsOnboarding: Bool {
@@ -1661,6 +1846,11 @@ struct ContentView: View {
 
             ScrollView(.vertical, showsIndicators: true) {
                 VStack(alignment: .leading, spacing: 0) {
+                    if vm.updateAvailable && vm.canSelfUpdate {
+                        updateBanner
+                            .padding(.horizontal, 16)
+                            .padding(.top, 16)
+                    }
                     controlsSection.padding(16)
                     if vm.showsAIFeatures {
                         Divider().padding(.horizontal, 16)
@@ -1684,6 +1874,56 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    private var updateBanner: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundColor(.blue)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Update available")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text("Awake \(vm.latestVersion) is available. You’re on \(vm.cliVersion) via \(installSourceLabel(vm.updateInstallSource)).")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer()
+            }
+
+            HStack(spacing: 8) {
+                if vm.canSelfUpdate {
+                    Button(vm.updateInFlight ? "Updating…" : "Update now") {
+                        vm.applyUpdate()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .tint(.blue)
+                    .disabled(vm.updateInFlight || vm.isBusy)
+                }
+
+                Button("What’s new") {
+                    vm.openLatestReleasePage()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Spacer()
+            }
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.blue.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.blue.opacity(0.16), lineWidth: 1)
+        )
     }
 
     private var onboardingView: some View {
@@ -2304,6 +2544,80 @@ struct ContentView: View {
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Text("Version")
+                                .font(.system(size: 12, weight: .medium))
+                            Spacer()
+                            Text("app \(vm.appVersion) • cli \(vm.cliVersion)")
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .foregroundColor(.secondary)
+                        }
+
+                        HStack(spacing: 8) {
+                            Text("Updates")
+                                .font(.system(size: 12, weight: .medium))
+                            Spacer()
+                            Text(vm.updateStatusSummary)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(vm.updateAvailable ? .blue : (!vm.updateErrorText.isEmpty ? .orange : .secondary))
+                        }
+
+                        HStack(spacing: 8) {
+                            Button(vm.updateChecking ? "Checking…" : "Check for updates") {
+                                vm.checkForUpdatesNow()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(vm.updateChecking || vm.updateInFlight)
+
+                            if vm.updateAvailable && vm.canSelfUpdate {
+                                Button(vm.updateInFlight ? "Updating…" : "Update now") {
+                                    vm.applyUpdate()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                                .tint(.blue)
+                                .disabled(vm.updateInFlight || vm.isBusy)
+                            } else if vm.updateInstallSource == "repo" {
+                                Button("Open repo") {
+                                    vm.openRepoPage()
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            } else {
+                                Button("Latest release") {
+                                    vm.openLatestReleasePage()
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+
+                            Spacer()
+                        }
+
+                        if !vm.updateErrorText.isEmpty {
+                            Text(vm.updateErrorText)
+                                .font(.system(size: 10))
+                                .foregroundColor(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else if let hint = vm.manualUpdateHint {
+                            Text(hint)
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .padding(10)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(Color.blue.opacity(0.04))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(Color.blue.opacity(0.12), lineWidth: 1)
+                    )
 
                     Toggle(isOn: Binding(
                         get: { vm.allowDisplaySleep },

@@ -14,10 +14,39 @@ APP_ROOT="$HOME/.local/bin/Awake.app"
 RESOURCE_BIN_DIR="$APP_DIR/Resources/bin"
 SCRIPT_SOURCE_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 REPO_SRC_FILE="$SCRIPT_SOURCE_DIR/ui/main.swift"
+PACKAGE_JSON_SOURCE="$SCRIPT_SOURCE_DIR/package.json"
+PACKAGE_JSON_BUNDLED="$SCRIPT_SOURCE_DIR/awake-package.json"
+LOCAL_PACKAGE_JSON="$HOME/.local/bin/awake-package.json"
 ICON_SCRIPT="$SCRIPT_SOURCE_DIR/awake-build-icon"
 ICON_FILE="$APP_DIR/Resources/Awake.icns"
+BUNDLED_UI_DIR="$APP_DIR/Resources/ui"
 
 log() { echo "[awake-build-ui] $(date '+%H:%M:%S') $*"; }
+
+resolve_package_version() {
+    /usr/bin/python3 - "$PACKAGE_JSON_SOURCE" "$LOCAL_PACKAGE_JSON" <<'PY'
+import json
+import os
+import sys
+
+for path in sys.argv[1:]:
+    if not path or not os.path.exists(path):
+        continue
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+        version = payload.get("version")
+        if version:
+            print(version)
+            raise SystemExit(0)
+    except Exception:
+        continue
+
+print("2.0.2")
+PY
+}
+
+PACKAGE_VERSION="$(resolve_package_version "$PACKAGE_JSON_BUNDLED" "$PACKAGE_JSON_SOURCE" "$LOCAL_PACKAGE_JSON")"
 
 # --- 1. Prefer repo source when available ---
 
@@ -56,12 +85,15 @@ fi
 
 # --- 4. Create/update app bundle ---
 
-mkdir -p "$APP_DIR/MacOS" "$APP_DIR/Resources" "$RESOURCE_BIN_DIR"
+mkdir -p "$APP_DIR/MacOS" "$APP_DIR/Resources" "$RESOURCE_BIN_DIR" "$BUNDLED_UI_DIR"
 
 # Copy binary into bundle
 cp "$BINARY" "$APP_DIR/MacOS/AwakeUI"
 chmod +x "$APP_DIR/MacOS/AwakeUI"
 log "Installed binary to $APP_DIR/MacOS/AwakeUI"
+
+# Keep the bundle self-contained so it can reinstall/rebuild itself later.
+cp "$SRC_FILE" "$BUNDLED_UI_DIR/main.swift"
 
 # Copy bundled helper scripts so the .app is self-contained
 for tool in awake awake-hook awake-notify awake-build-ui awake-build-icon; do
@@ -70,6 +102,11 @@ for tool in awake awake-hook awake-notify awake-build-ui awake-build-icon; do
         chmod +x "$RESOURCE_BIN_DIR/$tool"
     fi
 done
+if [ -f "$PACKAGE_JSON_SOURCE" ]; then
+    cp "$PACKAGE_JSON_SOURCE" "$RESOURCE_BIN_DIR/awake-package.json"
+elif [ -f "$LOCAL_PACKAGE_JSON" ]; then
+    cp "$LOCAL_PACKAGE_JSON" "$RESOURCE_BIN_DIR/awake-package.json"
+fi
 log "Bundled helper scripts into $RESOURCE_BIN_DIR"
 
 if [ -x "$ICON_SCRIPT" ]; then
@@ -88,9 +125,9 @@ cat > "$APP_DIR/Info.plist" << 'PLIST'
     <key>CFBundleIdentifier</key>
     <string>com.awake.menubar</string>
     <key>CFBundleVersion</key>
-    <string>2.0</string>
+    <string>__AWAKE_VERSION__</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.0</string>
+    <string>__AWAKE_VERSION__</string>
     <key>CFBundleExecutable</key>
     <string>AwakeUI</string>
     <key>CFBundleIconFile</key>
@@ -113,6 +150,7 @@ cat > "$APP_DIR/Info.plist" << 'PLIST'
 </dict>
 </plist>
 PLIST
+perl -0pi -e 's/__AWAKE_VERSION__/'"$PACKAGE_VERSION"'/g' "$APP_DIR/Info.plist"
 log "Updated Info.plist (CFBundleExecutable=AwakeUI)"
 
 # Remove old Python launcher if present

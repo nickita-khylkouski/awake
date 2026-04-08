@@ -41,9 +41,13 @@ LOCAL_BIN_DIR="$HOME/.local/bin"
 LOCAL_APP_SRC_DIR="$LOCAL_BIN_DIR/AwakeApp"
 LOCAL_APP_SRC_FILE="$LOCAL_APP_SRC_DIR/main.swift"
 REPO_APP_SRC_FILE="$SCRIPT_DIR/ui/main.swift"
+BUNDLED_APP_SRC_FILE="$(CDPATH='' cd -- "$SCRIPT_DIR/.." 2>/dev/null && pwd)/ui/main.swift"
+LOCAL_PACKAGE_JSON="$LOCAL_BIN_DIR/awake-package.json"
 BASELINE_FILE="$HOME/.config/awake/power-baseline.json"
 MODE_FILE="$HOME/.config/awake/default-mode"
 RULES_DIR="$HOME/.config/awake/rules.d"
+INSTALL_METADATA_FILE="$HOME/.config/awake/install-metadata.json"
+UPDATE_CACHE_FILE="$HOME/.config/awake/update-cache.json"
 PID_FILE="/tmp/awake.pid"
 DAEMON_LOCK_DIR="/tmp/awake-daemon.lock"
 DAEMON_OWNER_FILE="$DAEMON_LOCK_DIR/pid"
@@ -58,6 +62,10 @@ DISPLAY_SLEEP_FILE="/tmp/awake-display-sleep"
 WHY_FILE="/tmp/awake-why"
 BATTERY_GUARD_FILE="/tmp/awake-battery-guard"
 LOG_PREFIX="[awake]"
+PACKAGE_NAME="awake-agent"
+GITHUB_RELEASES_URL="https://github.com/nickita-khylkouski/awake/releases/latest"
+UPDATE_CACHE_TTL="${AWAKE_UPDATE_CACHE_TTL:-21600}"
+UPDATE_APPLY_TIMEOUT="${AWAKE_UPDATE_APPLY_TIMEOUT:-300}"
 
 # --- Helpers ---
 
@@ -133,6 +141,360 @@ read_file_value() {
     local path="$1"
     [ -f "$path" ] || return 1
     cat "$path" 2>/dev/null
+}
+
+package_json_candidate_paths() {
+    printf '%s\n' \
+        "${AWAKE_PACKAGE_JSON_PATH:-}" \
+        "$SCRIPT_DIR/awake-package.json" \
+        "$SCRIPT_DIR/package.json" \
+        "$LOCAL_PACKAGE_JSON"
+}
+
+current_package_version() {
+    if [ -n "${AWAKE_PACKAGE_VERSION:-}" ]; then
+        printf '%s\n' "$AWAKE_PACKAGE_VERSION"
+        return 0
+    fi
+
+    local candidate
+    for candidate in $(package_json_candidate_paths); do
+        [ -n "$candidate" ] || continue
+        [ -f "$candidate" ] || continue
+        /usr/bin/python3 - "$candidate" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        payload = json.load(f)
+    version = payload.get("version")
+    if version:
+        print(version)
+        raise SystemExit(0)
+except Exception:
+    pass
+raise SystemExit(1)
+PY
+        if [ $? -eq 0 ]; then
+            return 0
+        fi
+    done
+
+    local version_from_metadata
+    version_from_metadata="$(install_metadata_field packageVersion 2>/dev/null || true)"
+    [ -n "$version_from_metadata" ] || version_from_metadata="$(install_metadata_field currentVersion 2>/dev/null || true)"
+    if [ -n "$version_from_metadata" ]; then
+        printf '%s\n' "$version_from_metadata"
+        return 0
+    fi
+
+    printf 'unknown\n'
+}
+
+install_metadata_field() {
+    local field="$1"
+    [ -f "$INSTALL_METADATA_FILE" ] || return 1
+    /usr/bin/python3 - "$INSTALL_METADATA_FILE" "$field" <<'PY'
+import json, sys
+path, field = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        payload = json.load(f)
+    value = payload.get(field)
+except Exception:
+    raise SystemExit(1)
+
+if value is None or value == "":
+    raise SystemExit(1)
+if isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
+PY
+}
+
+current_app_version() {
+    local plist="$LOCAL_BIN_DIR/Awake.app/Contents/Info.plist"
+    if [ -f "$plist" ]; then
+        local version
+        version="$(/usr/bin/defaults read "$plist" CFBundleShortVersionString 2>/dev/null || true)"
+        [ -n "$version" ] && { printf '%s\n' "$version"; return 0; }
+    fi
+    current_package_version
+}
+
+detect_install_source() {
+    if [ -n "${AWAKE_UPDATE_SOURCE_TYPE:-}" ]; then
+        local detail="${AWAKE_UPDATE_SOURCE_DETAIL:-${SCRIPT_PATH}}"
+        printf '%s|%s\n' "$AWAKE_UPDATE_SOURCE_TYPE" "$detail"
+        return 0
+    fi
+
+    case "$SCRIPT_PATH" in
+        "$LOCAL_BIN_DIR/awake"|"$LOCAL_BIN_DIR/Awake.app/Contents/Resources/bin/awake")
+            local existing_type existing_detail
+            existing_type="$(install_metadata_field sourceType 2>/dev/null || true)"
+            existing_detail="$(install_metadata_field sourcePath 2>/dev/null || true)"
+            if [ -n "$existing_type" ]; then
+                printf '%s|%s\n' "$existing_type" "${existing_detail:-$SCRIPT_PATH}"
+                return 0
+            fi
+            printf 'local-copy|%s\n' "$SCRIPT_PATH"
+            return 0
+            ;;
+        *"/_npx/"*"/node_modules/awake-agent/"*|*"/npm/_npx/"*"/node_modules/awake-agent/"*)
+            printf 'npx|%s\n' "$SCRIPT_PATH"
+            return 0
+            ;;
+        *"/lib/node_modules/awake-agent/"*)
+            printf 'npm-global|%s\n' "$SCRIPT_PATH"
+            return 0
+            ;;
+        *"/node_modules/awake-agent/"*)
+            local npm_prefix
+            npm_prefix="$(npm prefix -g 2>/dev/null || true)"
+            if [ -n "$npm_prefix" ] && [[ "$SCRIPT_PATH" == "$npm_prefix"* ]]; then
+                printf 'npm-global|%s\n' "$SCRIPT_PATH"
+            else
+                printf 'local-copy|%s\n' "$SCRIPT_PATH"
+            fi
+            return 0
+            ;;
+    esac
+
+    if [ -d "$SCRIPT_DIR/.git" ] || git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+        printf 'repo|%s\n' "$SCRIPT_DIR"
+        return 0
+    fi
+
+    printf 'unknown|%s\n' "$SCRIPT_PATH"
+}
+
+write_install_metadata() {
+    local source_info source_type source_path package_version
+    source_info="$(detect_install_source)"
+    source_type="${source_info%%|*}"
+    source_path="${source_info#*|}"
+    package_version="$(current_package_version)"
+
+    mkdir -p "$(dirname "$INSTALL_METADATA_FILE")"
+    cat > "$INSTALL_METADATA_FILE" <<EOF
+{
+  "version": 1,
+  "packageName": "$PACKAGE_NAME",
+  "packageVersion": "$(json_escape "$package_version")",
+  "currentVersion": "$(json_escape "$package_version")",
+  "sourceType": "$(json_escape "$source_type")",
+  "sourcePath": "$(json_escape "$source_path")",
+  "installedAt": $(now_epoch)
+}
+EOF
+}
+
+version_is_newer() {
+    local lhs="$1"
+    local rhs="$2"
+    /usr/bin/python3 - "$lhs" "$rhs" <<'PY'
+import re, sys
+left, right = sys.argv[1], sys.argv[2]
+
+def parse(raw: str):
+    pieces = []
+    for chunk in raw.split("."):
+        match = re.match(r"(\d+)", chunk)
+        pieces.append(int(match.group(1)) if match else 0)
+    return pieces
+
+a = parse(left)
+b = parse(right)
+size = max(len(a), len(b))
+a.extend([0] * (size - len(a)))
+b.extend([0] * (size - len(b)))
+raise SystemExit(0 if a > b else 1)
+PY
+}
+
+update_command_for_source() {
+    local source_type="$1"
+    case "$source_type" in
+        npx)
+            printf 'npx --yes %s@latest install' "$PACKAGE_NAME"
+            ;;
+        npm-global)
+            printf 'npm install -g %s@latest && awake install' "$PACKAGE_NAME"
+            ;;
+        repo)
+            printf 'git pull && awake install'
+            ;;
+        local-copy|unknown)
+            printf 'npx --yes %s@latest install' "$PACKAGE_NAME"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+npm_global_awake_path() {
+    local prefix
+    prefix="$(npm prefix -g 2>/dev/null || true)"
+    if [ -n "$prefix" ] && [ -x "$prefix/bin/awake" ]; then
+        printf '%s\n' "$prefix/bin/awake"
+        return 0
+    fi
+    return 1
+}
+
+run_with_timeout() {
+    local timeout_seconds="$1"
+    shift
+    /usr/bin/python3 - "$timeout_seconds" "$@" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+timeout = int(sys.argv[1])
+cmd = sys.argv[2:]
+proc = subprocess.Popen(cmd, start_new_session=True)
+try:
+    raise SystemExit(proc.wait(timeout=timeout))
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    print(f"[awake] update command timed out after {timeout}s", file=sys.stderr)
+    raise SystemExit(124)
+PY
+}
+
+python_update_tool() {
+    /usr/bin/python3 - "$@" <<'PY'
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+action = sys.argv[1]
+
+def parse_version(raw: str):
+    parts = []
+    for piece in raw.split("."):
+        digits = ""
+        for char in piece:
+            if char.isdigit():
+                digits += char
+            else:
+                break
+        parts.append(int(digits or "0"))
+    return parts
+
+def is_newer(latest: str, current: str) -> bool:
+    left = parse_version(latest)
+    right = parse_version(current)
+    size = max(len(left), len(right))
+    left.extend([0] * (size - len(left)))
+    right.extend([0] * (size - len(right)))
+    return left > right
+
+if action == "update-status":
+    cache_path, package_name, current_version, app_version, source_type, source_detail, release_url, force_refresh = sys.argv[2:10]
+    ttl = int(os.environ.get("AWAKE_UPDATE_CACHE_TTL", "21600"))
+    now = int(time.time())
+    latest = None
+    checked_at = None
+    cached = False
+    error = None
+    source = "cache"
+
+    override = os.environ.get("AWAKE_UPDATE_LATEST_VERSION")
+    if override:
+        latest = override
+        checked_at = now
+        source = "override"
+    else:
+        payload = None
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path) as f:
+                    payload = json.load(f)
+            except Exception:
+                payload = None
+
+        if payload:
+            latest = payload.get("latestVersion")
+            checked_at = payload.get("checkedAt")
+            error = payload.get("error")
+            try:
+                checked_at_int = int(checked_at) if checked_at is not None else None
+            except (TypeError, ValueError):
+                checked_at_int = None
+            if latest and checked_at_int and force_refresh != "true" and (now - checked_at_int) < ttl:
+                checked_at = checked_at_int
+                cached = True
+                source = payload.get("source", "cache")
+
+        if not cached:
+            registry_url = os.environ.get("AWAKE_UPDATE_REGISTRY_URL", f"https://registry.npmjs.org/{package_name}/latest")
+            try:
+                with urllib.request.urlopen(registry_url, timeout=6) as response:
+                    fetched = json.loads(response.read().decode("utf-8"))
+                latest = fetched.get("version")
+                checked_at = now
+                error = None
+                source = "npm"
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                with open(cache_path, "w") as f:
+                    json.dump({
+                        "version": 1,
+                        "packageName": package_name,
+                        "latestVersion": latest,
+                        "checkedAt": checked_at,
+                        "source": source,
+                        "error": None,
+                    }, f, indent=2)
+                    f.write("\n")
+            except Exception as exc:
+                error = str(exc)
+                if latest:
+                    cached = True
+                    source = "stale-cache"
+                else:
+                    latest = current_version
+                    checked_at = now
+                    source = "unavailable"
+
+    update_available = bool(
+        latest
+        and current_version
+        and latest != "unknown"
+        and current_version != "unknown"
+        and is_newer(latest, current_version)
+    )
+    can_self_update = source_type in {"npx", "npm-global"}
+
+    print(json.dumps({
+        "packageName": package_name,
+        "currentVersion": current_version,
+        "appVersion": app_version,
+        "latestVersion": latest,
+        "updateAvailable": update_available,
+        "installSource": source_type,
+        "installSourceDetail": source_detail,
+        "canSelfUpdate": can_self_update,
+        "checkedAt": checked_at,
+        "cached": cached,
+        "error": error,
+        "releaseURL": release_url,
+        "source": source,
+    }))
+    raise SystemExit(0)
+
+raise SystemExit(f"unknown action: {action}")
+PY
 }
 
 lease_dir() {
@@ -1797,6 +2159,140 @@ cmd_doctor() {
     echo "warnings:      $warnings"
 }
 
+update_status_json() {
+    local source_info source_type source_detail current_version app_version force_refresh
+    source_info="$(detect_install_source)"
+    source_type="${source_info%%|*}"
+    source_detail="${source_info#*|}"
+    current_version="$(current_package_version)"
+    app_version="$(current_app_version)"
+    force_refresh="${1:-false}"
+    python_update_tool update-status \
+        "$UPDATE_CACHE_FILE" \
+        "$PACKAGE_NAME" \
+        "$current_version" \
+        "$app_version" \
+        "$source_type" \
+        "$source_detail" \
+        "$GITHUB_RELEASES_URL" \
+        "$force_refresh"
+}
+
+cmd_update() {
+    local sub="${1:-status}"
+    shift || true
+    case "$sub" in
+        status)
+            local refresh=false
+            [ "${1:-}" = "--refresh" ] && refresh=true
+            if [ "${2:-}" = "--json" ] || [ "${1:-}" = "--json" ]; then
+                update_status_json "$refresh"
+                return 0
+            fi
+            local payload
+            payload="$(update_status_json "$refresh")"
+            /usr/bin/python3 - "$payload" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+print(f"current:       {payload.get('currentVersion')}")
+print(f"app:           {payload.get('appVersion')}")
+print(f"latest:        {payload.get('latestVersion')}")
+print(f"source:        {payload.get('installSource')}")
+print(f"self-update:   {'yes' if payload.get('canSelfUpdate') else 'no'}")
+print(f"checked:       {payload.get('checkedAt')}")
+if payload.get("error"):
+    print("status:        check failed")
+elif payload.get("updateAvailable"):
+    print("status:        update available")
+else:
+    print("status:        up to date")
+if payload.get("error"):
+    print(f"warning:       {payload.get('error')}")
+PY
+            ;;
+        apply)
+            local force=false
+            [ "${1:-}" = "--force" ] && force=true
+            local payload source_type can_self update_available update_error update_command
+            payload="$(update_status_json true)"
+            source_type="$(/usr/bin/python3 - "$payload" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+print(payload.get("installSource", "unknown"))
+print("true" if payload.get("canSelfUpdate") else "false")
+print("true" if payload.get("updateAvailable") else "false")
+print(payload.get("error") or "")
+PY
+)"
+            local source_lines=()
+            while IFS= read -r line; do
+                source_lines+=("$line")
+            done <<< "$source_type"
+            source_type="${source_lines[0]:-unknown}"
+            can_self="${source_lines[1]:-false}"
+            update_available="${source_lines[2]:-false}"
+            update_error="${source_lines[3]:-}"
+
+            if [ "$update_available" != "true" ] && [ -n "$update_error" ] && ! $force; then
+                log "Could not confirm whether an update is available: $update_error"
+                return 1
+            fi
+
+            if [ "$update_available" != "true" ] && ! $force; then
+                log "Awake is already up to date"
+                return 0
+            fi
+
+            if [ "$can_self" != "true" ]; then
+                log "Self-update is not supported for install source: $source_type"
+                if [ "$source_type" = "repo" ]; then
+                    log "Update from git, then rerun: awake install"
+                fi
+                return 1
+            fi
+
+            update_command="$(update_command_for_source "$source_type" 2>/dev/null || true)"
+            [ -n "$update_command" ] || {
+                log "Could not determine update command for source: $source_type"
+                return 1
+            }
+
+            log "Updating Awake via $source_type..."
+            case "$source_type" in
+                npx)
+                    run_with_timeout "$UPDATE_APPLY_TIMEOUT" npx --yes "$PACKAGE_NAME@latest" install
+                    ;;
+                npm-global)
+                    run_with_timeout "$UPDATE_APPLY_TIMEOUT" npm install -g "$PACKAGE_NAME@latest" || return 1
+                    local global_awake
+                    global_awake="$(npm_global_awake_path 2>/dev/null || true)"
+                    if [ -n "$global_awake" ]; then
+                        run_with_timeout "$UPDATE_APPLY_TIMEOUT" "$global_awake" install
+                    else
+                        run_with_timeout "$UPDATE_APPLY_TIMEOUT" npx --yes "$PACKAGE_NAME@latest" install
+                    fi
+                    ;;
+                *)
+                    log "No supported updater for source: $source_type"
+                    return 1
+                    ;;
+            esac
+            ;;
+        clear-cache)
+            rm -f "$UPDATE_CACHE_FILE"
+            log "Update cache cleared"
+            ;;
+        *)
+            echo "Usage: awake update [status [--refresh] [--json]|apply [--force]|clear-cache]"
+            return 1
+            ;;
+    esac
+}
+
+cmd_version() {
+    current_package_version
+}
+
 cmd_rules() {
     ensure_runtime_dirs
     local sub="${1:-list}"
@@ -2005,8 +2501,13 @@ cmd_install() {
     copy_if_present "$SCRIPT_DIR/awake-build-icon" "$LOCAL_BIN_DIR/awake-build-icon" || true
     copy_if_present "$SCRIPT_DIR/awake-hook" "$LOCAL_BIN_DIR/awake-hook" || true
     copy_if_present "$SCRIPT_DIR/awake-notify" "$LOCAL_BIN_DIR/awake-notify" || true
+    copy_if_present "$SCRIPT_DIR/awake-package.json" "$LOCAL_PACKAGE_JSON" || true
+    copy_if_present "$SCRIPT_DIR/package.json" "$LOCAL_PACKAGE_JSON" || true
     if [ -f "$REPO_APP_SRC_FILE" ]; then
         cp "$REPO_APP_SRC_FILE" "$LOCAL_APP_SRC_FILE"
+    elif [ -f "$BUNDLED_APP_SRC_FILE" ]; then
+        mkdir -p "$LOCAL_APP_SRC_DIR"
+        cp "$BUNDLED_APP_SRC_FILE" "$LOCAL_APP_SRC_FILE"
     fi
 
     if ! echo "$PATH" | tr ':' '\n' | grep -Fxq "$LOCAL_BIN_DIR"; then
@@ -2090,6 +2591,8 @@ CONF
         log "Codex: not installed (skipping)"
     fi
 
+    write_install_metadata
+
     if [ -d "$LOCAL_BIN_DIR/Awake.app" ]; then
         if $auto_open; then
             log "Opening Awake.app..."
@@ -2140,6 +2643,7 @@ case "${1:-}" in
     start)      cmd_daemon_start --bg ;;
     stop)       cmd_stop ;;
     sleep)      force_sleep ;;
+    version|--version|-v) cmd_version ;;
     on)         lease_create_or_update "manual-toggle" "manual" "$(current_default_mode)" "Manual awake session" 100 "" "cli"; reconcile_effective_state ;;
     nosleep)    activate_nosleep ;;
     nosleep-display) activate_nosleep_display ;;
@@ -2148,6 +2652,7 @@ case "${1:-}" in
     why)        shift; cmd_why "$@" ;;
     doctor)     shift; cmd_doctor "$@" ;;
     mode)       shift; cmd_mode "$@" ;;
+    update)     shift; cmd_update "$@" ;;
     rules)      shift; cmd_rules "$@" ;;
     for)        cmd_for "${2:-}" ;;
     until)      cmd_until "${2:-}" ;;
@@ -2161,6 +2666,6 @@ case "${1:-}" in
     settings)   shift; cmd_settings "$@" ;;
     setup)      shift; cmd_setup "$@" ;;
     temp)       shift; cmd_temp "$@" ;;
-    *)          echo "Usage: awake [start|stop|sleep|on|nosleep|nosleep-display|yessleep|status [--json]|why|doctor|mode ...|rules ...|for <dur>|until <time>|cancel-timer|run <cmd>|ui|install|uninstall|settings ...|setup ...|temp [json|value]]"
+    *)          echo "Usage: awake [start|stop|sleep|version|on|nosleep|nosleep-display|yessleep|status [--json]|why|doctor|mode ...|update ...|rules ...|for <dur>|until <time>|cancel-timer|run <cmd>|ui|install|uninstall|settings ...|setup ...|temp [json|value]]"
                 exit 1 ;;
 esac

@@ -79,6 +79,11 @@ cat > "$STUB_BIN/osascript" <<'EOF'
 exit 0
 EOF
 
+cat > "$STUB_BIN/open" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+
 cat > "$STUB_BIN/claude" <<'EOF'
 #!/bin/bash
 exit 0
@@ -101,5 +106,15 @@ touch "$TEST_HOME/.codex/config.toml"
 [ -f "$TEST_HOME/.claude/settings.json" ]
 grep -Fq "awake-hook claude" "$TEST_HOME/.claude/settings.json"
 grep -Fq 'notify = "'"$TEST_HOME"'/.local/bin/awake-notify"' "$TEST_HOME/.codex/config.toml"
+[ -f "$TEST_HOME/.local/bin/awake-package.json" ]
+[ -f "$TEST_HOME/.config/awake/install-metadata.json" ]
+grep -Fq '"packageName": "awake-agent"' "$TEST_HOME/.config/awake/install-metadata.json"
+[ -f "$TEST_HOME/.local/bin/Awake.app/Contents/Resources/bin/awake-package.json" ]
+[ -f "$TEST_HOME/.local/bin/Awake.app/Contents/Resources/ui/main.swift" ]
+
+rm -f "$TEST_HOME/.local/bin/awake-package.json" "$TEST_HOME/.local/bin/AwakeApp/main.swift"
+"$TEST_HOME/.local/bin/Awake.app/Contents/Resources/bin/awake" install >/dev/null
+[ -f "$TEST_HOME/.local/bin/awake-package.json" ]
+[ -f "$TEST_HOME/.local/bin/AwakeApp/main.swift" ]
 
 echo "install flow tests passed"

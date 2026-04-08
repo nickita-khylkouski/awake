@@ -1,6 +1,6 @@
 {
   "name": "awake-agent",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Keep your Mac awake while AI coding agents run.",
   "license": "MIT",
   "os": [
@@ -10,6 +10,7 @@
     "awake": "awake"
   },
   "files": [
+    "package.json",
     "README.md",
     "config.example",
     "awake",
