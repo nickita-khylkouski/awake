@@ -23,17 +23,18 @@
 
   <text x="96" y="126" fill="#E2E8F0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="26" letter-spacing="0.18em">AGENT-AWARE KEEP-AWAKE FOR MACOS</text>
   <text x="96" y="232" fill="white" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="78" font-weight="700">awake</text>
-  <text x="96" y="294" fill="#CBD5E1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="34">Keeps your Mac alive while Claude Code, Codex, and</text>
-  <text x="96" y="338" fill="#CBD5E1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="34">other coding agents are actually doing work.</text>
+  <text x="96" y="294" fill="#CBD5E1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="31">Keeps your Mac awake while</text>
+  <text x="96" y="334" fill="#CBD5E1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="31">coding agents are actually</text>
+  <text x="96" y="374" fill="#CBD5E1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="31">doing work.</text>
 
-  <rect x="96" y="392" width="196" height="54" rx="27" fill="#22C55E"/>
-  <text x="126" y="427" fill="#052E16" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="25" font-weight="700">daemon aware</text>
+  <rect x="96" y="426" width="196" height="54" rx="27" fill="#22C55E"/>
+  <text x="126" y="461" fill="#052E16" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="25" font-weight="700">daemon aware</text>
 
-  <rect x="308" y="392" width="180" height="54" rx="27" fill="#0F172A" stroke="#334155"/>
-  <text x="339" y="427" fill="#E2E8F0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="25" font-weight="600">native UI</text>
+  <rect x="308" y="426" width="180" height="54" rx="27" fill="#0F172A" stroke="#334155"/>
+  <text x="339" y="461" fill="#E2E8F0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="25" font-weight="600">native UI</text>
 
-  <rect x="504" y="392" width="220" height="54" rx="27" fill="#0F172A" stroke="#334155"/>
-  <text x="536" y="427" fill="#E2E8F0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="25" font-weight="600">safe restore</text>
+  <rect x="504" y="426" width="220" height="54" rx="27" fill="#0F172A" stroke="#334155"/>
+  <text x="536" y="461" fill="#E2E8F0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="25" font-weight="600">safe restore</text>
 
   <g filter="url(#shadow)">
     <rect x="748" y="92" width="436" height="456" rx="28" fill="url(#panel)"/>
