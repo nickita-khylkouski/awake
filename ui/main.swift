@@ -37,7 +37,7 @@ let CPU_TEMP_HISTORY_PATH = NSString("~/.config/awake/cpu-temp-history.json").ex
 let CPU_TEMP_HISTORY_WINDOW: TimeInterval = 12 * 60 * 60
 let CPU_TEMP_SAMPLE_INTERVAL: TimeInterval = 60
 let ONBOARDING_STATE_PATH = NSString("~/.config/awake/onboarding-completed.json").expandingTildeInPath
-let ONBOARDING_VERSION = 1
+let ONBOARDING_VERSION = 2
 
 let AGENTS: [String] = {
     if let env = ProcessInfo.processInfo.environment["AWAKE_AGENTS"] {
@@ -239,12 +239,43 @@ enum OnboardingStep: Int, CaseIterable {
     }
 }
 
+enum AwakeAudience: String, CaseIterable, Identifiable {
+    case ai = "ai"
+    case personal = "personal"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .ai: return "AI coding agents"
+        case .personal: return "Personal use"
+        }
+    }
+
+    var shortTitle: String {
+        switch self {
+        case .ai: return "AI user"
+        case .personal: return "Personal user"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .ai:
+            return "Show daemon, agent detection, hooks, and automatic protection for coding workflows."
+        case .personal:
+            return "Keep Awake focused on manual sessions, timers, and simple Mac sleep control."
+        }
+    }
+}
+
 struct OnboardingCompletionRecord: Codable {
     let version: Int
     let completedAt: TimeInterval
     let sleepControlConfiguredAtCompletion: Bool
     let automaticProtectionEnabled: Bool
     let chosenDefaultMode: String
+    let usageProfile: String?
 }
 
 func loadOnboardingCompletionRecord() -> OnboardingCompletionRecord? {
@@ -632,6 +663,7 @@ class AwakeViewModel: ObservableObject {
     @Published var codexDetected: Bool = false
     @Published var codexConfigured: Bool = false
     @Published var showOnboarding: Bool = false
+    @Published var audience: AwakeAudience = .ai
     @Published var defaultMode: String = "running"
     @Published var effectiveMode: String = ""
     @Published var effectiveResolvedMode: String = ""
@@ -668,12 +700,20 @@ class AwakeViewModel: ObservableObject {
         return formatModeLabel(defaultMode)
     }
 
+    var showsAIFeatures: Bool {
+        audience == .ai
+    }
+
     init() {
         allowDisplaySleep = FileManager.default.fileExists(atPath: DISPLAY_SLEEP_FILE)
         launchAgentInstalled = isLaunchAgentInstalled()
         menuBarControlConfigured = hasMenuBarControlAccess()
         isOnAC = PowerMonitor.isOnAC()
         loadCpuTemperatureHistory()
+        if let record = loadOnboardingCompletionRecord(),
+           let profile = record.usageProfile.flatMap(AwakeAudience.init(rawValue:)) {
+            audience = profile
+        }
 
         NotificationManager.shared.setup()
 
@@ -854,11 +894,43 @@ class AwakeViewModel: ObservableObject {
     }
 
     func finishOnboarding() {
+        let record = OnboardingCompletionRecord(
+            version: ONBOARDING_VERSION,
+            completedAt: Date().timeIntervalSince1970,
+            sleepControlConfiguredAtCompletion: sleepControlConfigured,
+            automaticProtectionEnabled: launchAgentInstalled,
+            chosenDefaultMode: defaultMode,
+            usageProfile: audience.rawValue
+        )
+        saveOnboardingCompletionRecord(record)
         showOnboarding = false
     }
 
     func reopenOnboarding() {
         showOnboarding = true
+    }
+
+    func setAudience(_ newAudience: AwakeAudience) {
+        audience = newAudience
+        if newAudience == .personal && defaultMode == "agent-safe" {
+            defaultMode = "running"
+            setDefaultMode("running")
+        }
+        if onboardingEvaluated && !showOnboarding {
+            persistOnboardingProfile()
+        }
+    }
+
+    private func persistOnboardingProfile() {
+        let record = OnboardingCompletionRecord(
+            version: ONBOARDING_VERSION,
+            completedAt: Date().timeIntervalSince1970,
+            sleepControlConfiguredAtCompletion: sleepControlConfigured,
+            automaticProtectionEnabled: launchAgentInstalled,
+            chosenDefaultMode: defaultMode,
+            usageProfile: audience.rawValue
+        )
+        saveOnboardingCompletionRecord(record)
     }
 
     private func loadCpuTemperatureHistory() {
@@ -1033,6 +1105,7 @@ class AwakeViewModel: ObservableObject {
         snap.modeText = appliedModeLabel
         snap.whyText = truncateForMenu(whyAwakeText)
         snap.warningCount = warnings.count
+        snap.showsAIFeatures = showsAIFeatures
         onMenuDataUpdate?(snap)
     }
 
@@ -1067,7 +1140,10 @@ class AwakeViewModel: ObservableObject {
     }
 
     var needsOnboarding: Bool {
-        !sleepControlConfigured
+        guard let record = loadOnboardingCompletionRecord() else { return true }
+        guard record.version >= ONBOARDING_VERSION else { return true }
+        guard let profile = record.usageProfile, AwakeAudience(rawValue: profile) != nil else { return true }
+        return false
     }
 
     private func applyPowerSettingsSnapshot(_ snapshot: PowerSettingsSnapshot) {
@@ -1579,8 +1655,10 @@ struct ContentView: View {
             ScrollView(.vertical, showsIndicators: true) {
                 VStack(alignment: .leading, spacing: 0) {
                     controlsSection.padding(16)
-                    Divider().padding(.horizontal, 16)
-                    whySection.padding(16)
+                    if vm.showsAIFeatures {
+                        Divider().padding(.horizontal, 16)
+                        whySection.padding(16)
+                    }
                     Divider().padding(.horizontal, 16)
                     statusSection.padding(16)
                     Divider().padding(.horizontal, 16)
@@ -1607,10 +1685,19 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Set Up Awake")
                         .font(.system(size: 22, weight: .bold))
-                    Text("Finish the first-run setup so Awake can keep your Mac from sleeping, including when the lid is closed.")
+                    Text("Choose how you plan to use Awake, then finish the first-run setup so it can keep your Mac from sleeping when you need it.")
                         .font(.system(size: 12))
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("How will you use Awake?")
+                        .font(.system(size: 13, weight: .semibold))
+
+                    ForEach(AwakeAudience.allCases) { option in
+                        onboardingAudienceCard(option)
+                    }
                 }
 
                 onboardingStep(
@@ -1635,14 +1722,32 @@ struct ContentView: View {
                     action: vm.enableCpuTemperatureAccess
                 )
 
-                onboardingStep(
-                    title: "Start on login",
-                    detail: "Optional. Launches the Awake daemon automatically when you sign in.",
-                    status: vm.launchAgentInstalled ? "Enabled" : "Disabled",
-                    ready: vm.launchAgentInstalled,
-                    actionTitle: "Enable",
-                    action: vm.toggleLaunchAgent
-                )
+                if vm.showsAIFeatures {
+                    onboardingStep(
+                        title: "Start automatic agent protection",
+                        detail: "Optional. Launches the Awake daemon automatically when you sign in so coding-agent protection is always available.",
+                        status: vm.launchAgentInstalled ? "Enabled" : "Disabled",
+                        ready: vm.launchAgentInstalled,
+                        actionTitle: "Enable",
+                        action: vm.toggleLaunchAgent
+                    )
+                } else {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Personal mode hides daemon, hooks, and agent diagnostics so the app stays focused on manual keep-awake sessions.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(14)
+                    .background(
+                        RoundedRectangle(cornerRadius: 14)
+                            .fill(Color(nsColor: .controlBackgroundColor))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14)
+                            .stroke(Color.blue.opacity(0.14), lineWidth: 1)
+                    )
+                }
 
                 onboardingStep(
                     title: "Allow menu bar control",
@@ -1678,6 +1783,39 @@ struct ContentView: View {
             }
             .padding(20)
         }
+    }
+
+    @ViewBuilder
+    private func onboardingAudienceCard(_ option: AwakeAudience) -> some View {
+        Button(action: { vm.setAudience(option) }) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: vm.audience == option ? "checkmark.circle.fill" : "circle")
+                    .foregroundColor(vm.audience == option ? .green : .secondary)
+                    .font(.system(size: 18))
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(option.title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(.primary)
+                    Text(option.detail)
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer()
+            }
+            .padding(14)
+            .background(
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .stroke(vm.audience == option ? Color.green.opacity(0.22) : Color.secondary.opacity(0.12), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     @ViewBuilder
@@ -1776,7 +1914,7 @@ struct ContentView: View {
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundColor(.secondary)
                     }
-                    if vm.agentsActive {
+                    if vm.showsAIFeatures && vm.agentsActive {
                         Text("\u{2022} \(vm.agentsText)")
                             .font(.system(size: 11))
                             .foregroundColor(.secondary)
@@ -1797,7 +1935,7 @@ struct ContentView: View {
                 .foregroundColor(vm.isOnAC ? .green : .orange)
 
                 HStack(spacing: 4) {
-                    if vm.daemonRunning { TagBadge(text: "daemon", color: .green) }
+                    if vm.showsAIFeatures && vm.daemonRunning { TagBadge(text: "daemon", color: .green) }
                     if vm.timerActive { TagBadge(text: "timer", color: .orange) }
                     if vm.batteryLow { TagBadge(text: "low", color: .red) }
                 }
@@ -1821,35 +1959,37 @@ struct ContentView: View {
             cpuTemperatureCard
                 .padding(.bottom, 8)
 
-            StatRow(
-                label: "Agents",
-                value: vm.agentsText,
-                valueColor: vm.agentsActive ? .green : .secondary
-            )
+            if vm.showsAIFeatures {
+                StatRow(
+                    label: "Agents",
+                    value: vm.agentsText,
+                    valueColor: vm.agentsActive ? .green : .secondary
+                )
 
-            HStack(spacing: 6) {
-                Text("Hooks").font(.system(size: 12)).foregroundColor(.secondary)
-                Spacer()
-                Text(vm.hookCount > 0 ? "\(vm.hookCount) active" : "none")
-                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-                    .foregroundColor(vm.hookCount > 0 ? .green : .secondary)
-            }
-            .padding(.vertical, 2.5)
-
-            if !vm.hookSessionIds.isEmpty {
-                ForEach(vm.hookSessionIds, id: \.self) { sid in
-                    Text(sid)
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                        .padding(.leading, 14)
+                HStack(spacing: 6) {
+                    Text("Hooks").font(.system(size: 12)).foregroundColor(.secondary)
+                    Spacer()
+                    Text(vm.hookCount > 0 ? "\(vm.hookCount) active" : "none")
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .foregroundColor(vm.hookCount > 0 ? .green : .secondary)
                 }
-            }
+                .padding(.vertical, 2.5)
 
-            StatRow(
-                label: "Daemon",
-                value: vm.daemonRunning ? "running" : "stopped",
-                valueColor: vm.daemonRunning ? .green : .secondary
-            )
+                if !vm.hookSessionIds.isEmpty {
+                    ForEach(vm.hookSessionIds, id: \.self) { sid in
+                        Text(sid)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                            .padding(.leading, 14)
+                    }
+                }
+
+                StatRow(
+                    label: "Daemon",
+                    value: vm.daemonRunning ? "running" : "stopped",
+                    valueColor: vm.daemonRunning ? .green : .secondary
+                )
+            }
 
             if vm.timerActive {
                 StatRow(label: "Timer", value: vm.timerText, valueColor: .orange)
@@ -2031,24 +2171,28 @@ struct ContentView: View {
 
             Divider()
 
-            HStack(spacing: 8) {
-                Button(action: { vm.startDaemon() }) {
-                    Label("Start Daemon", systemImage: "play.fill")
-                        .font(.system(size: 12, weight: .medium))
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.regular)
-                .disabled(vm.daemonRunning || vm.isBusy)
+            if vm.showsAIFeatures {
+                HStack(spacing: 8) {
+                    Button(action: { vm.startDaemon() }) {
+                        Label("Start Daemon", systemImage: "play.fill")
+                            .font(.system(size: 12, weight: .medium))
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.regular)
+                    .disabled(vm.daemonRunning || vm.isBusy)
 
-                Button(action: { vm.stopDaemon() }) {
-                    Label("Stop Daemon", systemImage: "stop.fill")
-                        .font(.system(size: 12, weight: .medium))
-                        .frame(maxWidth: .infinity)
+                    Button(action: { vm.stopDaemon() }) {
+                        Label("Stop Daemon", systemImage: "stop.fill")
+                            .font(.system(size: 12, weight: .medium))
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.regular)
+                    .disabled(!vm.daemonRunning || vm.isBusy)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.regular)
-                .disabled(!vm.daemonRunning || vm.isBusy)
+
+                Divider()
             }
 
             Button(role: .destructive, action: { vm.sleepNow() }) {
@@ -2059,19 +2203,21 @@ struct ContentView: View {
             .buttonStyle(.bordered)
             .controlSize(.regular)
 
-            Divider()
-
             HStack(spacing: 6) {
                 Text("Default mode")
                     .font(.system(size: 12, weight: .medium))
-                InfoPopoverButton(text: "Used for daemon sessions, timers, and `awake run` commands.\n\nKeep Running is the default because it keeps the Mac awake without forcing the display to stay on.\n\nAgent Safe chooses automatically based on display-sleep settings. Keep Presenting keeps both the Mac and the display awake.")
+                InfoPopoverButton(text: vm.showsAIFeatures
+                    ? "Used for daemon sessions, timers, and `awake run` commands.\n\nKeep Running is the default because it keeps the Mac awake without forcing the display to stay on.\n\nAgent Safe chooses automatically based on display-sleep settings. Keep Presenting keeps both the Mac and the display awake."
+                    : "Used for timers and `awake run` commands.\n\nKeep Running keeps the Mac awake without forcing the display to stay on. Keep Presenting keeps both the Mac and the display awake.")
 
                 Picker("", selection: Binding(
                     get: { vm.defaultMode },
                     set: { vm.setDefaultMode($0) }
                 )) {
                     Text("Keep Running").tag("running")
-                    Text("Agent Safe").tag("agent-safe")
+                    if vm.showsAIFeatures {
+                        Text("Agent Safe").tag("agent-safe")
+                    }
                     Text("Keep Presenting").tag("presenting")
                 }
                 .labelsHidden()
@@ -2080,7 +2226,9 @@ struct ContentView: View {
                 Spacer()
             }
 
-            Text("Applies when Awake starts automatically or through timers and commands.")
+            Text(vm.showsAIFeatures
+                ? "Applies when Awake starts automatically or through timers and commands."
+                : "Applies to timers and command-based Awake sessions.")
                 .font(.system(size: 10))
                 .foregroundColor(.secondary)
         }
@@ -2092,6 +2240,32 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 10) {
             DisclosureGroup(isExpanded: $showSettings) {
                 VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 8) {
+                        Text("Use Awake as")
+                            .font(.system(size: 12, weight: .medium))
+
+                        Picker("", selection: Binding(
+                            get: { vm.audience },
+                            set: { vm.setAudience($0) }
+                        )) {
+                            ForEach(AwakeAudience.allCases) { option in
+                                Text(option.shortTitle).tag(option)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .labelsHidden()
+                        .frame(width: 150, alignment: .leading)
+
+                        Spacer()
+                    }
+
+                    Text(vm.showsAIFeatures
+                        ? "Shows daemon, agent, and automatic protection controls."
+                        : "Hides daemon, hooks, and most AI diagnostics to keep the app simpler.")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
                     Toggle(isOn: Binding(
                         get: { vm.allowDisplaySleep },
                         set: { _ in vm.toggleDisplaySleep() }
@@ -2107,20 +2281,22 @@ struct ContentView: View {
                     .toggleStyle(.switch)
                     .tint(.green)
 
-                    Toggle(isOn: Binding(
-                        get: { vm.launchAgentInstalled },
-                        set: { _ in vm.toggleLaunchAgent() }
-                    )) {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("Start at login")
-                                .font(.system(size: 12))
-                            Text("Auto-start daemon on login")
-                                .font(.system(size: 10))
-                                .foregroundColor(.secondary)
+                    if vm.showsAIFeatures {
+                        Toggle(isOn: Binding(
+                            get: { vm.launchAgentInstalled },
+                            set: { _ in vm.toggleLaunchAgent() }
+                        )) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("Start at login")
+                                    .font(.system(size: 12))
+                                Text("Auto-start daemon on login")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.secondary)
+                            }
                         }
+                        .toggleStyle(.switch)
+                        .tint(.green)
                     }
-                    .toggleStyle(.switch)
-                    .tint(.green)
 
                     VStack(alignment: .leading, spacing: 1) {
                         Text("Dock icon")
@@ -2216,14 +2392,25 @@ struct ContentView: View {
                             }
                             InfoPopoverButton(text: "These are your baseline Mac sleep settings.\n\nExample: if `System sleep after` is 15m and Awake is inactive, macOS will sleep normally after 15 minutes. If Awake is active, Awake temporarily overpowers that until it turns off.\n\nLike macOS System Settings, changes here apply immediately.")
                         }
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            showPowerSettings.toggle()
+                        }
                     }
                 }
                 .padding(.top, 8)
             } label: {
-                SectionLabel(
-                    text: "Settings",
-                    help: "Persistent settings for how your Mac behaves when Awake is not actively overriding sleep.\n\nExample: set `Display sleep after` to 5m here, then Awake can temporarily ignore that while an agent is running."
-                )
+                HStack {
+                    SectionLabel(
+                        text: "Settings",
+                        help: "Persistent settings for how your Mac behaves when Awake is not actively overriding sleep.\n\nExample: set `Display sleep after` to 5m here, then Awake can temporarily ignore that while an agent is running."
+                    )
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    showSettings.toggle()
+                }
             }
         }
     }
@@ -2500,6 +2687,7 @@ struct MenuSnapshot {
     var modeText: String = ""
     var whyText: String = ""
     var warningCount: Int = 0
+    var showsAIFeatures: Bool = true
 }
 
 // MARK: - App Delegate
@@ -2830,14 +3018,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         headerItem.attributedTitle = NSAttributedString(string: statusText, attributes: attrs)
         menu.addItem(headerItem)
 
-        if !s.agents.isEmpty {
+        if s.showsAIFeatures && !s.agents.isEmpty {
             let agentStr = s.agents.sorted(by: { $0.key < $1.key }).map { "\($0.key)(\($0.value))" }.joined(separator: " ")
             let agentItem = NSMenuItem(title: "  Agents: \(agentStr)", action: nil, keyEquivalent: "")
             agentItem.isEnabled = false
             menu.addItem(agentItem)
         }
 
-        if s.hookCount > 0 {
+        if s.showsAIFeatures && s.hookCount > 0 {
             let hookItem = NSMenuItem(title: "  Hooks: \(s.hookCount) active", action: nil, keyEquivalent: "")
             hookItem.isEnabled = false
             menu.addItem(hookItem)
@@ -2878,7 +3066,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(whyItem)
         }
 
-        if s.warningCount > 0 {
+        if s.showsAIFeatures && s.warningCount > 0 {
             let warningItem = NSMenuItem(title: "  Warnings: \(s.warningCount)", action: nil, keyEquivalent: "")
             warningItem.isEnabled = false
             menu.addItem(warningItem)
@@ -2907,10 +3095,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         timerParent.submenu = timerMenu
         menu.addItem(timerParent)
 
-        if s.isDaemon {
-            menu.addItem(NSMenuItem(title: "Stop Daemon", action: #selector(menuStopDaemon), keyEquivalent: ""))
-        } else {
-            menu.addItem(NSMenuItem(title: "Start Daemon", action: #selector(menuStartDaemon), keyEquivalent: ""))
+        if s.showsAIFeatures {
+            if s.isDaemon {
+                menu.addItem(NSMenuItem(title: "Stop Daemon", action: #selector(menuStopDaemon), keyEquivalent: ""))
+            } else {
+                menu.addItem(NSMenuItem(title: "Start Daemon", action: #selector(menuStartDaemon), keyEquivalent: ""))
+            }
         }
 
         menu.addItem(NSMenuItem.separator())
