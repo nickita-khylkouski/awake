@@ -7,10 +7,7 @@
     "darwin"
   ],
   "bin": {
-    "awake": "./awake",
-    "awake-build-ui": "./awake-build-ui",
-    "awake-hook": "./awake-hook",
-    "awake-notify": "./awake-notify"
+    "awake": "awake"
   },
   "files": [
     "README.md",
