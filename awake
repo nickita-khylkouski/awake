@@ -13,6 +13,7 @@ POLL_INTERVAL=15
 GRACE_SECONDS=300       # 5 minutes
 BATTERY_CRITICAL=5      # force sleep even if agents running
 BATTERY_WARN=15         # send notification
+MODE_DEFAULT="agent-safe"
 
 # --- Load config ---
 
@@ -41,15 +42,20 @@ LOCAL_APP_SRC_DIR="$LOCAL_BIN_DIR/AwakeApp"
 LOCAL_APP_SRC_FILE="$LOCAL_APP_SRC_DIR/main.swift"
 REPO_APP_SRC_FILE="$SCRIPT_DIR/ui/main.swift"
 BASELINE_FILE="$HOME/.config/awake/power-baseline.json"
+MODE_FILE="$HOME/.config/awake/default-mode"
+RULES_DIR="$HOME/.config/awake/rules.d"
 PID_FILE="/tmp/awake.pid"
 DAEMON_LOCK_DIR="/tmp/awake-daemon.lock"
 DAEMON_OWNER_FILE="$DAEMON_LOCK_DIR/pid"
+LEASES_DIR="/tmp/awake-leases"
 STATE_FILE="/tmp/awake-state"
 LAST_ACTIVE_FILE="/tmp/awake-last-active"
 CAFFEINE_PID_FILE="/tmp/awake-caffeinate.pid"
 FOR_PID_FILE="/tmp/awake-for.pid"
 FOR_END_FILE="/tmp/awake-for-end"
 FOR_TOKEN_FILE="/tmp/awake-for-token"
+DISPLAY_SLEEP_FILE="/tmp/awake-display-sleep"
+WHY_FILE="/tmp/awake-why"
 LOG_PREFIX="[awake]"
 
 # --- Helpers ---
@@ -58,10 +64,232 @@ log() { echo "$LOG_PREFIX $(date '+%H:%M:%S') $*"; }
 
 now_epoch() { date +%s; }
 
+ensure_runtime_dirs() {
+    mkdir -p "$LEASES_DIR" "$RULES_DIR" "$(dirname "$MODE_FILE")"
+}
+
+json_escape() {
+    local value="${1:-}"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf '%s' "$value"
+}
+
+json_optional_string() {
+    local value="${1:-}"
+    if [ -n "$value" ]; then
+        printf '"%s"' "$(json_escape "$value")"
+    else
+        printf 'null'
+    fi
+}
+
+current_default_mode() {
+    local mode
+    mode="$(read_file_value "$MODE_FILE" 2>/dev/null || true)"
+    case "$mode" in
+        running|presenting|agent-safe) echo "$mode" ;;
+        *) echo "$MODE_DEFAULT" ;;
+    esac
+}
+
+set_default_mode() {
+    local mode="$1"
+    case "$mode" in
+        running|presenting|agent-safe) ;;
+        *)
+            echo "Invalid mode: $mode (use running|presenting|agent-safe)"
+            return 1
+            ;;
+    esac
+    mkdir -p "$(dirname "$MODE_FILE")"
+    echo "$mode" > "$MODE_FILE"
+}
+
+resolve_mode() {
+    local mode="${1:-agent-safe}"
+    case "$mode" in
+        running|presenting)
+            echo "$mode"
+            ;;
+        agent-safe)
+            if [ -f "$DISPLAY_SLEEP_FILE" ]; then
+                echo "running"
+            else
+                echo "presenting"
+            fi
+            ;;
+        *)
+            echo "presenting"
+            ;;
+    esac
+}
+
 read_file_value() {
     local path="$1"
     [ -f "$path" ] || return 1
     cat "$path" 2>/dev/null
+}
+
+lease_dir() {
+    echo "$LEASES_DIR/$1"
+}
+
+lease_field() {
+    local id="$1"
+    local field="$2"
+    read_file_value "$(lease_dir "$id")/$field"
+}
+
+lease_exists() {
+    [ -d "$(lease_dir "$1")" ]
+}
+
+lease_create_or_update() {
+    local id="$1"
+    local type="$2"
+    local mode="$3"
+    local reason="$4"
+    local priority="$5"
+    local expires_at="${6:-}"
+    local source="${7:-}"
+    ensure_runtime_dirs
+    local dir
+    dir="$(lease_dir "$id")"
+    mkdir -p "$dir"
+    if [ ! -f "$dir/started_at" ]; then
+        echo "$(now_epoch)" > "$dir/started_at"
+    fi
+    printf '%s' "$id" > "$dir/id"
+    printf '%s' "$type" > "$dir/type"
+    printf '%s' "$mode" > "$dir/mode"
+    printf '%s' "$reason" > "$dir/reason"
+    printf '%s' "$priority" > "$dir/priority"
+    printf '%s' "$source" > "$dir/source"
+    printf '%s' "${expires_at:-}" > "$dir/expires_at"
+}
+
+lease_remove() {
+    rm -rf "$(lease_dir "$1")"
+}
+
+lease_has_expired() {
+    local id="$1"
+    local expires_at
+    expires_at="$(lease_field "$id" expires_at 2>/dev/null || true)"
+    [ -n "$expires_at" ] || return 1
+    [ "$expires_at" -gt 0 ] 2>/dev/null || return 1
+    [ "$(now_epoch)" -ge "$expires_at" ]
+}
+
+cleanup_expired_leases() {
+    ensure_runtime_dirs
+    local dir id
+    for dir in "$LEASES_DIR"/*; do
+        [ -d "$dir" ] || continue
+        id="$(basename "$dir")"
+        if lease_has_expired "$id"; then
+            rm -rf "$dir"
+        fi
+    done
+}
+
+best_lease_id() {
+    cleanup_expired_leases
+    ensure_runtime_dirs
+    local dir id best_id="" best_priority=-9999 best_started=0
+    local priority started
+    for dir in "$LEASES_DIR"/*; do
+        [ -d "$dir" ] || continue
+        id="$(basename "$dir")"
+        priority="$(lease_field "$id" priority 2>/dev/null || echo 0)"
+        started="$(lease_field "$id" started_at 2>/dev/null || echo 0)"
+        if [ "$priority" -gt "$best_priority" ] 2>/dev/null || { [ "$priority" -eq "$best_priority" ] 2>/dev/null && [ "$started" -ge "$best_started" ] 2>/dev/null; }; then
+            best_id="$id"
+            best_priority="$priority"
+            best_started="$started"
+        fi
+    done
+    [ -n "$best_id" ] || return 1
+    echo "$best_id"
+}
+
+effective_mode_value() {
+    local id
+    id="$(best_lease_id 2>/dev/null || true)"
+    [ -n "$id" ] || return 1
+    lease_field "$id" mode
+}
+
+effective_resolved_mode() {
+    local mode
+    mode="$(effective_mode_value 2>/dev/null || true)"
+    [ -n "$mode" ] || return 1
+    resolve_mode "$mode"
+}
+
+effective_reason_value() {
+    local id
+    id="$(best_lease_id 2>/dev/null || true)"
+    [ -n "$id" ] || return 1
+    lease_field "$id" reason
+}
+
+lease_count() {
+    ensure_runtime_dirs
+    local dir count=0
+    for dir in "$LEASES_DIR"/*; do
+        [ -d "$dir" ] || continue
+        count=$(( count + 1 ))
+    done
+    echo "$count"
+}
+
+rule_lease_count() {
+    ensure_runtime_dirs
+    local dir count=0
+    for dir in "$LEASES_DIR"/rule-*; do
+        [ -d "$dir" ] || continue
+        count=$(( count + 1 ))
+    done
+    echo "$count"
+}
+
+clear_manual_leases() {
+    lease_remove "manual-toggle"
+    lease_remove "manual-timer"
+    lease_remove "run-command"
+}
+
+cancel_timer_session() {
+    lease_remove "manual-timer"
+    if [ -f "$FOR_PID_FILE" ]; then
+        kill "$(cat "$FOR_PID_FILE")" 2>/dev/null || true
+    fi
+    rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE"
+}
+
+rule_dir() {
+    echo "$RULES_DIR/$1"
+}
+
+rule_field() {
+    local id="$1"
+    local field="$2"
+    read_file_value "$(rule_dir "$id")/$field"
+}
+
+rule_count() {
+    ensure_runtime_dirs
+    local dir count=0
+    for dir in "$RULES_DIR"/*; do
+        [ -d "$dir" ] || continue
+        count=$(( count + 1 ))
+    done
+    echo "$count"
 }
 
 pid_is_alive() {
@@ -78,11 +306,36 @@ pid_matches_awake_daemon() {
     [[ "$cmd" == *"_daemon"* && "$cmd" == *"$(basename "$SCRIPT_PATH")"* ]]
 }
 
+daemon_pid_from_process_list() {
+    ps -axo pid=,command= 2>/dev/null | while read -r pid cmdline; do
+        [ -n "$pid" ] || continue
+        case "$cmdline" in
+            *"/awake _daemon"*|*" awake _daemon"*)
+                if pid_matches_awake_daemon "$pid"; then
+                    echo "$pid"
+                    return 0
+                fi
+                ;;
+        esac
+    done | head -n 1
+}
+
 active_daemon_pid() {
     local pid
-    pid="$(read_file_value "$PID_FILE")" || return 1
-    pid_matches_awake_daemon "$pid" || return 1
+    pid="$(read_file_value "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "$pid" ] && pid_matches_awake_daemon "$pid"; then
+        echo "$pid"
+        return 0
+    fi
+    pid="$(daemon_pid_from_process_list)"
+    [ -n "$pid" ] || return 1
     echo "$pid"
+}
+
+cleanup_stale_daemon_lease() {
+    if [ -d "$(lease_dir daemon-agent)" ] && ! active_daemon_pid >/dev/null 2>&1; then
+        lease_remove "daemon-agent"
+    fi
 }
 
 timer_running() {
@@ -335,7 +588,6 @@ entries = hooks.get("PreToolUse", [])
 for entry in entries:
     for hook in entry.get("hooks", []):
         if hook.get("type") == "command" and hook.get("command") == command:
-            print("installed")
             raise SystemExit(0)
 raise SystemExit(1)
 PY
@@ -391,13 +643,45 @@ install_codex_notify() {
 }
 
 setup_status_json() {
-    printf '{"sleepControlConfigured":%s,"temperatureConfigured":%s,"claudeDetected":%s,"claudeConfigured":%s,"codexDetected":%s,"codexConfigured":%s}\n' \
-        "${HAS_PMSET:-false}" \
-        "${HAS_POWERMETRICS:-false}" \
-        "${HAS_CLAUDE:-false}" \
-        "${HAS_CLAUDE_HOOK:-false}" \
-        "${HAS_CODEX:-false}" \
-        "${HAS_CODEX_NOTIFY:-false}"
+    sync_rule_leases
+    cleanup_expired_leases
+    local winning_lease="" effective_mode="" resolved_mode="" effective_reason=""
+    local batt="" charging=false
+    winning_lease="$(best_lease_id 2>/dev/null || true)"
+    effective_mode="$(effective_mode_value 2>/dev/null || true)"
+    resolved_mode="$(effective_resolved_mode 2>/dev/null || true)"
+    effective_reason="$(effective_reason_value 2>/dev/null || true)"
+    batt="$(get_battery_pct 2>/dev/null || true)"
+    on_ac_power || charging=false
+    if on_ac_power; then
+        charging=true
+    fi
+
+    printf '{'
+    printf '"sleepControlConfigured":%s,' "${HAS_PMSET:-false}"
+    printf '"temperatureConfigured":%s,' "${HAS_POWERMETRICS:-false}"
+    printf '"claudeDetected":%s,' "${HAS_CLAUDE:-false}"
+    printf '"claudeConfigured":%s,' "${HAS_CLAUDE_HOOK:-false}"
+    printf '"codexDetected":%s,' "${HAS_CODEX:-false}"
+    printf '"codexConfigured":%s,' "${HAS_CODEX_NOTIFY:-false}"
+    printf '"powerState":"%s",' "$(json_escape "$(current_state)")"
+    printf '"daemonRunning":%s,' "$([ -n "$(active_daemon_pid 2>/dev/null || true)" ] && echo true || echo false)"
+    printf '"timerActive":%s,' "$(timer_running && echo true || echo false)"
+    printf '"leaseCount":%s,' "$(lease_count)"
+    printf '"ruleCount":%s,' "$(rule_count)"
+    printf '"defaultMode":"%s",' "$(json_escape "$(current_default_mode)")"
+    printf '"effectiveLeaseId":%s,' "$(json_optional_string "$winning_lease")"
+    printf '"effectiveMode":%s,' "$(json_optional_string "$effective_mode")"
+    printf '"effectiveResolvedMode":%s,' "$(json_optional_string "$resolved_mode")"
+    printf '"effectiveReason":%s,' "$(json_optional_string "$effective_reason")"
+    printf '"whyAwake":"%s",' "$(json_escape "$(why_summary)")"
+    printf '"restorePlan":"%s",' "$(json_escape "$(restore_plan_summary)")"
+    printf '"batteryPercent":%s,' "${batt:-null}"
+    printf '"batteryCharging":%s,' "$charging"
+    printf '"leases":%s,' "$(leases_json)"
+    printf '"rules":%s,' "$(rules_json)"
+    printf '"warnings":%s' "$(warnings_json)"
+    printf '}\n'
 }
 
 get_battery_pct() {
@@ -405,7 +689,7 @@ get_battery_pct() {
 }
 
 is_charging() {
-    pmset -g batt | grep 'InternalBattery' | grep -qv 'discharging'
+    on_ac_power
 }
 
 HOOK_STALE_SECONDS=120  # 2 min without heartbeat = idle/dead
@@ -468,6 +752,206 @@ agent_summary() {
 
 current_state() {
     cat "$STATE_FILE" 2>/dev/null || echo "unknown"
+}
+
+on_ac_power() {
+    pmset -g batt | grep -q "AC Power"
+}
+
+current_wifi_ssid() {
+    if [ -n "${AWAKE_TEST_WIFI_SSID:-}" ]; then
+        echo "$AWAKE_TEST_WIFI_SSID"
+        return 0
+    fi
+    local airport="/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
+    if [ -x "$airport" ]; then
+        "$airport" -I 2>/dev/null | awk -F': ' '/ SSID/ {print $2; exit}'
+        return 0
+    fi
+    networksetup -getairportnetwork en0 2>/dev/null | sed 's/^Current Wi-Fi Network: //'
+}
+
+external_display_connected() {
+    if [ -n "${AWAKE_TEST_EXTERNAL_DISPLAY:-}" ]; then
+        [ "$AWAKE_TEST_EXTERNAL_DISPLAY" = "1" ]
+        return
+    fi
+    local count
+    count="$(system_profiler SPDisplaysDataType 2>/dev/null | grep -c 'Resolution:')" || count=0
+    [ "$count" -gt 1 ] 2>/dev/null
+}
+
+mode_label() {
+    case "$1" in
+        running) echo "Keep Running" ;;
+        presenting) echo "Keep Presenting" ;;
+        agent-safe) echo "Agent Safe" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+why_summary() {
+    local id mode resolved reason
+    id="$(best_lease_id 2>/dev/null || true)"
+    if [ -z "$id" ]; then
+        echo "Normal sleep. No active leases."
+        return 0
+    fi
+    mode="$(lease_field "$id" mode 2>/dev/null || echo agent-safe)"
+    resolved="$(resolve_mode "$mode")"
+    reason="$(lease_field "$id" reason 2>/dev/null || echo "Awake is active")"
+    echo "$reason ($id, $(mode_label "$mode"), resolved as $(mode_label "$resolved"))"
+}
+
+restore_plan_summary() {
+    local count
+    count="$(lease_count)"
+    if [ "$count" -eq 0 ]; then
+        echo "Restore baseline power settings immediately."
+    else
+        echo "Keep current wake state until the remaining leases end."
+    fi
+}
+
+rule_matches() {
+    local id="$1"
+    local type value
+    type="$(rule_field "$id" type 2>/dev/null || true)"
+    value="$(rule_field "$id" value 2>/dev/null || true)"
+    case "$type" in
+        process)
+            pgrep -x "$value" >/dev/null 2>&1 || pgrep -f "$value" >/dev/null 2>&1
+            ;;
+        power)
+            if [ "$value" = "ac" ]; then
+                on_ac_power
+            else
+                ! on_ac_power
+            fi
+            ;;
+        battery-above)
+            local batt
+            batt="$(get_battery_pct)"
+            [ -n "$batt" ] && [ "$batt" -ge "$value" ] 2>/dev/null
+            ;;
+        battery-below)
+            local batt
+            batt="$(get_battery_pct)"
+            [ -n "$batt" ] && [ "$batt" -le "$value" ] 2>/dev/null
+            ;;
+        wifi)
+            [ "$(current_wifi_ssid)" = "$value" ]
+            ;;
+        display)
+            [ "$value" = "external" ] && external_display_connected
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+sync_rule_leases() {
+    ensure_runtime_dirs
+    local dir id mode reason priority
+    for dir in "$RULES_DIR"/*; do
+        [ -d "$dir" ] || continue
+        id="$(basename "$dir")"
+        mode="$(rule_field "$id" mode 2>/dev/null || echo agent-safe)"
+        reason="$(rule_field "$id" reason 2>/dev/null || echo "Rule $id matched")"
+        priority="$(rule_field "$id" priority 2>/dev/null || echo 60)"
+        if rule_matches "$id"; then
+            lease_create_or_update "rule-$id" "rule" "$mode" "$reason" "$priority" "" "rule"
+        else
+            lease_remove "rule-$id"
+        fi
+    done
+}
+
+leases_json() {
+    cleanup_expired_leases
+    ensure_runtime_dirs
+    local dir id first=true
+    printf '['
+    for dir in "$LEASES_DIR"/*; do
+        [ -d "$dir" ] || continue
+        id="$(basename "$dir")"
+        $first || printf ','
+        first=false
+        local type mode reason priority started expires source
+        type="$(lease_field "$id" type 2>/dev/null || true)"
+        mode="$(lease_field "$id" mode 2>/dev/null || true)"
+        reason="$(lease_field "$id" reason 2>/dev/null || true)"
+        priority="$(lease_field "$id" priority 2>/dev/null || echo 0)"
+        started="$(lease_field "$id" started_at 2>/dev/null || echo 0)"
+        expires="$(lease_field "$id" expires_at 2>/dev/null || true)"
+        source="$(lease_field "$id" source 2>/dev/null || true)"
+        printf '{"id":"%s","type":"%s","mode":"%s","resolvedMode":"%s","reason":"%s","priority":%s,"startedAt":%s,"expiresAt":%s,"source":"%s"}' \
+            "$(json_escape "$id")" \
+            "$(json_escape "$type")" \
+            "$(json_escape "$mode")" \
+            "$(json_escape "$(resolve_mode "$mode")")" \
+            "$(json_escape "$reason")" \
+            "${priority:-0}" \
+            "${started:-0}" \
+            "${expires:-null}" \
+            "$(json_escape "$source")"
+    done
+    printf ']'
+}
+
+rules_json() {
+    ensure_runtime_dirs
+    local dir id first=true
+    printf '['
+    for dir in "$RULES_DIR"/*; do
+        [ -d "$dir" ] || continue
+        id="$(basename "$dir")"
+        $first || printf ','
+        first=false
+        local type value mode reason priority
+        type="$(rule_field "$id" type 2>/dev/null || true)"
+        value="$(rule_field "$id" value 2>/dev/null || true)"
+        mode="$(rule_field "$id" mode 2>/dev/null || echo agent-safe)"
+        reason="$(rule_field "$id" reason 2>/dev/null || true)"
+        priority="$(rule_field "$id" priority 2>/dev/null || echo 60)"
+        printf '{"id":"%s","type":"%s","value":"%s","mode":"%s","reason":"%s","priority":%s}' \
+            "$(json_escape "$id")" \
+            "$(json_escape "$type")" \
+            "$(json_escape "$value")" \
+            "$(json_escape "$mode")" \
+            "$(json_escape "$reason")" \
+            "${priority:-60}"
+    done
+    printf ']'
+}
+
+warnings_json() {
+    local -a warnings=()
+    has_passwordless_pmset || warnings+=("Sleep control not configured")
+    has_passwordless_powermetrics || warnings+=("Temperature sampling not configured")
+    if [ "$(lease_count)" -gt 0 ] && [ -n "$(get_battery_pct)" ] && ! on_ac_power; then
+        local batt
+        batt="$(get_battery_pct)"
+        if [ -n "$batt" ] && [ "$batt" -le "$BATTERY_WARN" ] 2>/dev/null; then
+            warnings+=("Battery is low while Awake is active")
+        fi
+    fi
+    if [ "$(lease_count)" -eq 0 ] && ! timer_running && [ -z "$(active_daemon_pid 2>/dev/null || true)" ] && [[ "$(current_state)" == nosleep* ]]; then
+        warnings+=("Nosleep state appears stale: no active leases are holding the machine awake")
+    fi
+    if [ ${#warnings[@]} -eq 0 ]; then
+        printf '[]'
+        return 0
+    fi
+    local first=true item
+    printf '['
+    for item in "${warnings[@]}"; do
+        $first || printf ','
+        first=false
+        printf '"%s"' "$(json_escape "$item")"
+    done
+    printf ']'
 }
 
 python_settings_tool() {
@@ -712,6 +1196,10 @@ restore_baseline_snapshot() {
     python_settings_tool restore-baseline >/dev/null 2>&1
 }
 
+restore_fallback_sleep_settings() {
+    sudo -n pmset -a disablesleep 0 sleep 10 displaysleep 10 standby 1 hibernatemode 3 2>/dev/null || true
+}
+
 baseline_setting_value() {
     local source="$1"
     local key="$2"
@@ -735,16 +1223,14 @@ restore_normal_sleep_settings() {
         kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
         rm -f "$CAFFEINE_PID_FILE"
     fi
-    # Kill any orphaned caffeinate processes
-    pkill -f "caffeinate -[di]" 2>/dev/null || true
     if ! restore_baseline_snapshot; then
-        sudo -n pmset -a disablesleep 0 2>/dev/null || true
+        restore_fallback_sleep_settings
     fi
     echo "normal" > "$STATE_FILE"
+    rm -f "$WHY_FILE"
 }
 
-activate_nosleep() {
-    # Use nosleep-full to distinguish from nosleep-display
+apply_presenting_mode() {
     local cs=$(current_state)
     if [ "$cs" = "nosleep-full" ] || [ "$cs" = "nosleep" ]; then
         # Migrate old format
@@ -757,17 +1243,16 @@ activate_nosleep() {
         log "ERROR: sudo pmset failed. Run: awake install"
         return 1
     }
-    # Kill tracked + any orphaned caffeinate -disu processes
+    # Kill only the caffeinate process Awake currently owns.
     if [ -f "$CAFFEINE_PID_FILE" ]; then
         kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
     fi
-    pkill -f "caffeinate -disu" 2>/dev/null || true
     caffeinate -disu &>/dev/null &
     echo $! > "$CAFFEINE_PID_FILE"
     echo "nosleep-full" > "$STATE_FILE"
 }
 
-activate_nosleep_display() {
+apply_running_mode() {
     local cs=$(current_state)
     if [ "$cs" = "nosleep-display" ]; then
         return 0
@@ -784,33 +1269,61 @@ activate_nosleep_display() {
     ac_display="$(baseline_setting_value ac displaysleep)"
     [ -n "$battery_display" ] && sudo -n pmset -b displaysleep "$battery_display" 2>/dev/null || true
     [ -n "$ac_display" ] && sudo -n pmset -c displaysleep "$ac_display" 2>/dev/null || true
-    # Kill tracked + any orphaned caffeinate processes
+    # Kill only the caffeinate process Awake currently owns.
     if [ -f "$CAFFEINE_PID_FILE" ]; then
         kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
     fi
-    pkill -f "caffeinate -isu" 2>/dev/null || true
-    pkill -f "caffeinate -disu" 2>/dev/null || true
     caffeinate -isu &>/dev/null &
     echo $! > "$CAFFEINE_PID_FILE"
     echo "nosleep-display" > "$STATE_FILE"
 }
 
-activate_yessleep() {
-    if [ "$(current_state)" = "normal" ]; then
+reconcile_effective_state() {
+    cleanup_expired_leases
+    cleanup_stale_daemon_lease
+    local id mode resolved reason
+    id="$(best_lease_id 2>/dev/null || true)"
+    if [ -z "$id" ]; then
+        restore_normal_sleep_settings
         return 0
     fi
-    log "Restoring normal sleep settings"
-    # Kill any active for-timer so it doesn't fire later
-    if [ -f "$FOR_PID_FILE" ]; then
-        kill "$(cat "$FOR_PID_FILE")" 2>/dev/null || true
-        rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE"
-    fi
-    restore_normal_sleep_settings
+    mode="$(lease_field "$id" mode 2>/dev/null || echo agent-safe)"
+    resolved="$(resolve_mode "$mode")"
+    reason="$(lease_field "$id" reason 2>/dev/null || echo "Awake is active")"
+    printf '%s\n' "$reason" > "$WHY_FILE"
+    case "$resolved" in
+        running) apply_running_mode ;;
+        presenting) apply_presenting_mode ;;
+        *) apply_presenting_mode ;;
+    esac
+}
+
+activate_nosleep() {
+    lease_create_or_update "manual-toggle" "manual" "presenting" "Manual awake session" 100 "" "cli"
+    reconcile_effective_state
+}
+
+activate_nosleep_display() {
+    lease_create_or_update "manual-toggle" "manual" "running" "Manual awake session with display sleep allowed" 100 "" "cli"
+    reconcile_effective_state
+}
+
+activate_yessleep() {
+    clear_manual_leases
+    cancel_timer_session
+    reconcile_effective_state
 }
 
 force_sleep() {
     log "Forcing sleep"
-    activate_yessleep
+    lease_remove "daemon-agent"
+    clear_manual_leases
+    local dir
+    for dir in "$LEASES_DIR"/rule-*; do
+        [ -d "$dir" ] || continue
+        rm -rf "$dir"
+    done
+    restore_normal_sleep_settings
     sleep 2
     sudo -n pmset sleepnow 2>/dev/null || true
 }
@@ -822,8 +1335,14 @@ cleanup() {
         return 0
     fi
     log "Shutting down — restoring normal sleep"
-    activate_yessleep
-    rm -f "$PID_FILE" "$STATE_FILE" "$LAST_ACTIVE_FILE" "$CAFFEINE_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE"
+    lease_remove "daemon-agent"
+    local dir
+    for dir in "$LEASES_DIR"/rule-*; do
+        [ -d "$dir" ] || continue
+        rm -rf "$dir"
+    done
+    reconcile_effective_state
+    rm -f "$PID_FILE" "$STATE_FILE" "$LAST_ACTIVE_FILE" "$CAFFEINE_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE" "$WHY_FILE"
     release_daemon_lock
 }
 
@@ -841,6 +1360,35 @@ parse_duration() {
     else
         echo ""
     fi
+}
+
+parse_until_time() {
+    local input="$1"
+    /usr/bin/python3 - "$input" <<'PY'
+import datetime
+import sys
+
+raw = sys.argv[1].strip().lower()
+patterns = ["%H:%M", "%I%p", "%I:%M%p"]
+value = raw.replace(" ", "")
+now = datetime.datetime.now()
+target = None
+
+for pattern in patterns:
+    try:
+        parsed = datetime.datetime.strptime(value, pattern)
+        target = now.replace(hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0)
+        if target <= now:
+            target += datetime.timedelta(days=1)
+        break
+    except ValueError:
+        continue
+
+if target is None:
+    raise SystemExit(1)
+
+print(int((target - now).total_seconds()))
+PY
 }
 
 cmd_settings() {
@@ -892,31 +1440,35 @@ cmd_temp() {
     esac
 }
 
+refresh_setup_flags() {
+    local has_pmset=false
+    local has_powermetrics=false
+    local has_claude=false
+    local has_claude_hook=false
+    local has_codex=false
+    local has_codex_notify=false
+
+    has_passwordless_pmset && has_pmset=true
+    has_passwordless_powermetrics && has_powermetrics=true
+    claude_detected && has_claude=true
+    claude_hook_installed && has_claude_hook=true
+    codex_detected && has_codex=true
+    codex_notify_installed && has_codex_notify=true
+
+    HAS_PMSET=$has_pmset
+    HAS_POWERMETRICS=$has_powermetrics
+    HAS_CLAUDE=$has_claude
+    HAS_CLAUDE_HOOK=$has_claude_hook
+    HAS_CODEX=$has_codex
+    HAS_CODEX_NOTIFY=$has_codex_notify
+}
+
 cmd_setup() {
     local sub="${1:-status-json}"
     case "$sub" in
         status|status-json)
-            local has_pmset=false
-            local has_powermetrics=false
-            local has_claude=false
-            local has_claude_hook=false
-            local has_codex=false
-            local has_codex_notify=false
-
-            has_passwordless_pmset && has_pmset=true
-            has_passwordless_powermetrics && has_powermetrics=true
-            claude_detected && has_claude=true
-            claude_hook_installed && has_claude_hook=true
-            codex_detected && has_codex=true
-            codex_notify_installed && has_codex_notify=true
-
-            HAS_PMSET=$has_pmset \
-            HAS_POWERMETRICS=$has_powermetrics \
-            HAS_CLAUDE=$has_claude \
-            HAS_CLAUDE_HOOK=$has_claude_hook \
-            HAS_CODEX=$has_codex \
-            HAS_CODEX_NOTIFY=$has_codex_notify \
-                setup_status_json
+            refresh_setup_flags
+            setup_status_json
             ;;
         claude)
             install_claude_hooks
@@ -939,6 +1491,7 @@ cmd_daemon_start() {
     local background=false
     local existing_pid
     [ "${1:-}" = "--bg" ] && background=true
+    ensure_runtime_dirs
 
     existing_pid="$(active_daemon_pid 2>/dev/null || true)"
     if [ -n "$existing_pid" ]; then
@@ -966,6 +1519,7 @@ cmd_daemon_start() {
 
 cmd_daemon() {
     trap cleanup EXIT INT TERM
+    ensure_runtime_dirs
     if ! acquire_daemon_lock; then
         log "Another awake daemon is already running"
         return 1
@@ -998,17 +1552,23 @@ cmd_daemon() {
             battery_warned=false  # reset when charging or no battery
         fi
 
+        sync_rule_leases
+
         # --- Agent detection / manual timer override ---
         if timer_running; then
             grace_start=0
-            if [[ "$(current_state)" != nosleep* ]]; then
-                activate_nosleep
-            fi
         elif agents_running; then
             echo "$(now_epoch)" > "$LAST_ACTIVE_FILE"
             grace_start=0
-            activate_nosleep
+            lease_create_or_update "daemon-agent" "daemon" "$(current_default_mode)" "Detected active coding agents" 70 "" "daemon"
         else
+            lease_remove "daemon-agent"
+            if [ "$(rule_lease_count)" -gt 0 ]; then
+                grace_start=0
+                reconcile_effective_state
+                sleep "$POLL_INTERVAL"
+                continue
+            fi
             if [ "$grace_start" -eq 0 ]; then
                 grace_start=$(now_epoch)
                 log "No agents — grace period ($(( GRACE_SECONDS / 60 ))m)"
@@ -1021,7 +1581,8 @@ cmd_daemon() {
             if [ "$remaining" -le 0 ]; then
                 log "Grace expired — forcing sleep"
                 notify "awake" "Grace period expired. Sleeping now."
-                force_sleep
+                lease_remove "daemon-agent"
+                reconcile_effective_state
                 grace_start=0
             else
                 if [[ "$(current_state)" == nosleep* ]]; then
@@ -1029,6 +1590,8 @@ cmd_daemon() {
                 fi
             fi
         fi
+
+        reconcile_effective_state
 
         sleep "$POLL_INTERVAL"
     done
@@ -1038,9 +1601,7 @@ cmd_stop() {
     local pid=""
     # Kill for-timer if running
     if [ -f "$FOR_PID_FILE" ]; then
-        local for_pid=$(cat "$FOR_PID_FILE")
-        kill "$for_pid" 2>/dev/null || true
-        rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE"
+        cancel_timer_session
         log "Cancelled awake-for timer"
     fi
 
@@ -1067,11 +1628,23 @@ cmd_stop() {
         return 0
     fi
 
-    activate_yessleep
-    rm -f "$STATE_FILE" "$LAST_ACTIVE_FILE" "$CAFFEINE_PID_FILE"
+    clear_manual_leases
+    lease_remove "daemon-agent"
+    local dir
+    for dir in "$LEASES_DIR"/rule-*; do
+        [ -d "$dir" ] || continue
+        rm -rf "$dir"
+    done
+    reconcile_effective_state
+    rm -f "$LAST_ACTIVE_FILE" "$CAFFEINE_PID_FILE"
 }
 
 cmd_status() {
+    if [ "${1:-}" = "--json" ]; then
+        refresh_setup_flags
+        setup_status_json
+        return 0
+    fi
     local running=false
     local daemon_pid=""
     daemon_pid="$(active_daemon_pid 2>/dev/null || true)"
@@ -1084,8 +1657,10 @@ cmd_status() {
 
     echo "awake daemon: $($running && echo "running (PID $daemon_pid)" || echo "not running")"
     echo "power state:  $state"
+    echo "mode:         $(effective_mode_value 2>/dev/null || echo "normal")"
     echo "agents:       $agents"
     echo "watching:     $AGENTS"
+    echo "why:          $(why_summary)"
 
     if [ -f "$LAST_ACTIVE_FILE" ]; then
         local last=$(cat "$LAST_ACTIVE_FILE")
@@ -1111,6 +1686,8 @@ cmd_status() {
     if timer_running; then
         echo "for timer:    active"
     fi
+    echo "leases:       $(lease_count)"
+    echo "rules:        $(rule_count)"
 
     # Sudoers
     if sudo -n pmset -g >/dev/null 2>&1; then
@@ -1123,6 +1700,138 @@ cmd_status() {
     else
         echo "sudo temp:    NOT CONFIGURED"
     fi
+}
+
+cmd_why() {
+    if [ "${1:-}" = "--json" ]; then
+        refresh_setup_flags
+        setup_status_json
+        return 0
+    fi
+    refresh_setup_flags
+    local payload
+    payload="$(setup_status_json)"
+    /usr/bin/python3 - "$payload" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+print(payload.get("whyAwake", "Unknown"))
+leases = payload.get("leases", [])
+if leases:
+    print("")
+    print("Active leases:")
+    for lease in sorted(leases, key=lambda l: (-int(l.get("priority", 0)), -int(l.get("startedAt", 0)))):
+        exp = lease.get("expiresAt")
+        suffix = f", expiresAt={exp}" if exp not in (None, "", 0) else ""
+        print(f"- {lease.get('id')}: {lease.get('reason')} [{lease.get('mode')} -> {lease.get('resolvedMode')}{suffix}]")
+PY
+}
+
+cmd_mode() {
+    local sub="${1:-show}"
+    case "$sub" in
+        show|get)
+            echo "$(current_default_mode)"
+            ;;
+        set)
+            local mode="${2:-}"
+            [ -n "$mode" ] || { echo "Usage: awake mode set <running|presenting|agent-safe>"; return 1; }
+            set_default_mode "$mode" || return 1
+            log "Default mode set to $(mode_label "$mode")"
+            ;;
+        *)
+            echo "Usage: awake mode [show|get|set <running|presenting|agent-safe>]"
+            return 1
+            ;;
+    esac
+}
+
+cmd_doctor() {
+    if [ "${1:-}" = "--json" ]; then
+        refresh_setup_flags
+        setup_status_json
+        return 0
+    fi
+    refresh_setup_flags
+    echo "Awake doctor"
+    echo "============"
+    echo "mode:          $(current_default_mode)"
+    echo "daemon:        $([ -n "$(active_daemon_pid 2>/dev/null || true)" ] && echo running || echo stopped)"
+    echo "leases:        $(lease_count)"
+    echo "rules:         $(rule_count)"
+    echo "sleep control: $([ "$HAS_PMSET" = true ] && echo ok || echo missing)"
+    echo "temperature:   $([ "$HAS_POWERMETRICS" = true ] && echo ok || echo missing)"
+    echo "claude hook:   $([ "$HAS_CLAUDE_HOOK" = true ] && echo ok || echo missing)"
+    echo "codex notify:  $([ "$HAS_CODEX_NOTIFY" = true ] && echo ok || echo missing)"
+    echo "why:           $(why_summary)"
+    local warnings
+    warnings="$(warnings_json)"
+    echo "warnings:      $warnings"
+}
+
+cmd_rules() {
+    ensure_runtime_dirs
+    local sub="${1:-list}"
+    shift || true
+    case "$sub" in
+        list)
+            if [ "${1:-}" = "--json" ]; then
+                printf '%s\n' "$(rules_json)"
+                return 0
+            fi
+            local dir id
+            for dir in "$RULES_DIR"/*; do
+                [ -d "$dir" ] || continue
+                id="$(basename "$dir")"
+                echo "$id: $(rule_field "$id" type) $(rule_field "$id" value) -> $(rule_field "$id" mode)"
+            done
+            ;;
+        export)
+            printf '%s\n' "$(rules_json)"
+            ;;
+        add)
+            local type="${1:-}"
+            local value="${2:-}"
+            shift 2 || true
+            [ -n "$type" ] && [ -n "$value" ] || { echo "Usage: awake rules add <process|power|battery-above|battery-below|wifi|display> <value> [--mode MODE] [--reason TEXT]"; return 1; }
+            local mode="agent-safe"
+            local reason=""
+            local priority="60"
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --mode) mode="${2:-}"; shift 2 ;;
+                    --reason) reason="${2:-}"; shift 2 ;;
+                    --priority) priority="${2:-60}"; shift 2 ;;
+                    *) echo "Unknown option: $1"; return 1 ;;
+                esac
+            done
+            case "$mode" in
+                running|presenting|agent-safe) ;;
+                *) echo "Invalid mode: $mode"; return 1 ;;
+            esac
+            [[ "$priority" =~ ^[0-9]+$ ]] || { echo "Priority must be an integer"; return 1; }
+            local id
+            id="$(printf '%s-%s-%s' "$type" "$value" "$(now_epoch)" | tr ' /' '--' | tr -cd '[:alnum:]._:-')"
+            local dir
+            dir="$(rule_dir "$id")"
+            mkdir -p "$dir"
+            printf '%s' "$type" > "$dir/type"
+            printf '%s' "$value" > "$dir/value"
+            printf '%s' "$mode" > "$dir/mode"
+            printf '%s' "${reason:-Rule $type=$value matched}" > "$dir/reason"
+            printf '%s' "$priority" > "$dir/priority"
+            echo "$id"
+            ;;
+        rm|remove|delete)
+            local id="${1:-}"
+            [ -n "$id" ] || { echo "Usage: awake rules rm <id>"; return 1; }
+            rm -rf "$(rule_dir "$id")"
+            lease_remove "rule-$id"
+            ;;
+        *)
+            echo "Usage: awake rules [list|list --json|export|add ...|rm <id>]"
+            return 1
+            ;;
+    esac
 }
 
 cmd_for() {
@@ -1149,7 +1858,6 @@ cmd_for() {
         rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE"
     fi
 
-    activate_nosleep
     local mins=$(( secs / 60 ))
     local end_epoch=$(( $(now_epoch) + secs ))
     local token
@@ -1160,6 +1868,8 @@ cmd_for() {
     # Write end time so UI can show countdown
     echo "$end_epoch" > "$FOR_END_FILE"
     echo "$token" > "$FOR_TOKEN_FILE"
+    lease_create_or_update "manual-timer" "timer" "$(current_default_mode)" "Manual timer active" 90 "" "cli"
+    reconcile_effective_state
 
     # Background timer
     (
@@ -1178,7 +1888,8 @@ cmd_for() {
             fi
             log "Timer expired — restoring Sleep OK"
             notify "awake" "Timer expired. Sleep OK restored."
-            restore_normal_sleep_settings
+            lease_remove "manual-timer"
+            reconcile_effective_state
             if timer_claim_is_current "$token" "$timer_pid"; then
                 rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE"
             fi
@@ -1189,6 +1900,22 @@ cmd_for() {
     disown
 
     echo "nosleep ON for ${mins}m, then Sleep OK. Cancel with: awake stop"
+}
+
+cmd_until() {
+    local target="${1:-}"
+    [ -n "$target" ] || { echo "Usage: awake until <HH:MM|5pm|5:30pm>"; return 1; }
+    local secs
+    secs="$(parse_until_time "$target" 2>/dev/null || true)"
+    [ -n "$secs" ] || { echo "Invalid clock time: $target"; return 1; }
+    local mins=$(( (secs + 59) / 60 ))
+    cmd_for "${mins}m"
+}
+
+cmd_cancel_timer() {
+    cancel_timer_session
+    reconcile_effective_state
+    log "Timer cancelled"
 }
 
 cmd_run_command() {
@@ -1202,7 +1929,8 @@ cmd_run_command() {
         return 1
     fi
 
-    activate_nosleep
+    lease_create_or_update "run-command" "command" "$(current_default_mode)" "Command running: $*" 85 "" "cli"
+    reconcile_effective_state
     log "Running: $*"
 
     local exit_code=0
@@ -1213,10 +1941,11 @@ cmd_run_command() {
         daemon_active=true
     fi
 
-    if timer_running || $daemon_active; then
+    lease_remove "run-command"
+    reconcile_effective_state
+    if timer_running || $daemon_active || [ "$(lease_count)" -gt 0 ]; then
         log "Command finished (exit $exit_code) — leaving restore to active awake session"
     else
-        activate_yessleep
         log "Command finished (exit $exit_code)"
         rm -f "$CAFFEINE_PID_FILE" "$STATE_FILE"
     fi
@@ -1308,13 +2037,11 @@ CONF
     fi
 
     # 5. Patch Claude Code settings.json
-    local settings
-    settings="$(claude_settings_path)"
-    if [ -f "$settings" ]; then
+    if claude_detected; then
         install_claude_hooks
         log "Claude Code hooks: installed"
     else
-        log "WARNING: $settings not found"
+        log "Claude Code: not installed (skipping)"
     fi
 
     # 5. Patch Codex config
@@ -1371,11 +2098,18 @@ case "${1:-}" in
     start)      cmd_daemon_start --bg ;;
     stop)       cmd_stop ;;
     sleep)      force_sleep ;;
+    on)         lease_create_or_update "manual-toggle" "manual" "$(current_default_mode)" "Manual awake session" 100 "" "cli"; reconcile_effective_state ;;
     nosleep)    activate_nosleep ;;
     nosleep-display) activate_nosleep_display ;;
     yessleep)   activate_yessleep ;;
-    status)     cmd_status ;;
+    status)     shift; cmd_status "$@" ;;
+    why)        shift; cmd_why "$@" ;;
+    doctor)     shift; cmd_doctor "$@" ;;
+    mode)       shift; cmd_mode "$@" ;;
+    rules)      shift; cmd_rules "$@" ;;
     for)        cmd_for "${2:-}" ;;
+    until)      cmd_until "${2:-}" ;;
+    cancel-timer) cmd_cancel_timer ;;
     run)        shift; cmd_run_command "$@" ;;
     ui)         cmd_ui ;;
     install)    cmd_install ;;
@@ -1385,6 +2119,6 @@ case "${1:-}" in
     settings)   shift; cmd_settings "$@" ;;
     setup)      shift; cmd_setup "$@" ;;
     temp)       shift; cmd_temp "$@" ;;
-    *)          echo "Usage: awake [start|stop|sleep|nosleep|nosleep-display|yessleep|status|for <dur>|run <cmd>|ui|install|uninstall|settings ...|setup ...|temp [json|value]]"
+    *)          echo "Usage: awake [start|stop|sleep|on|nosleep|nosleep-display|yessleep|status [--json]|why|doctor|mode ...|rules ...|for <dur>|until <time>|cancel-timer|run <cmd>|ui|install|uninstall|settings ...|setup ...|temp [json|value]]"
                 exit 1 ;;
 esac

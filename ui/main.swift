@@ -4,6 +4,7 @@ import Combine
 import UserNotifications
 import ApplicationServices
 import IOKit.ps
+import Carbon
 
 // MARK: - Constants
 
@@ -35,6 +36,8 @@ let LOG_MAX_LINES = 200
 let CPU_TEMP_HISTORY_PATH = NSString("~/.config/awake/cpu-temp-history.json").expandingTildeInPath
 let CPU_TEMP_HISTORY_WINDOW: TimeInterval = 12 * 60 * 60
 let CPU_TEMP_SAMPLE_INTERVAL: TimeInterval = 60
+let ONBOARDING_STATE_PATH = NSString("~/.config/awake/onboarding-completed.json").expandingTildeInPath
+let ONBOARDING_VERSION = 1
 
 let AGENTS: [String] = {
     if let env = ProcessInfo.processInfo.environment["AWAKE_AGENTS"] {
@@ -101,6 +104,15 @@ func runCommandCapture(_ executable: String, _ args: [String] = [], timeout: Tim
     }
 }
 
+@discardableResult
+func runLaunchCtl(_ args: [String], timeout: TimeInterval = 10) -> Bool {
+    let candidates = ["/bin/launchctl", "/usr/bin/launchctl"]
+    for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
+        return runCommandCapture(path, args, timeout: timeout).0
+    }
+    return false
+}
+
 func shellEscape(_ value: String) -> String {
     "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
 }
@@ -162,6 +174,44 @@ struct SetupSnapshot: Decodable {
     let claudeConfigured: Bool
     let codexDetected: Bool
     let codexConfigured: Bool
+    let powerState: String?
+    let daemonRunning: Bool?
+    let timerActive: Bool?
+    let leaseCount: Int?
+    let ruleCount: Int?
+    let defaultMode: String?
+    let effectiveLeaseId: String?
+    let effectiveMode: String?
+    let effectiveResolvedMode: String?
+    let effectiveReason: String?
+    let whyAwake: String?
+    let restorePlan: String?
+    let batteryPercent: Int?
+    let batteryCharging: Bool?
+    let leases: [LeaseSnapshot]?
+    let rules: [RuleSnapshot]?
+    let warnings: [String]?
+}
+
+struct LeaseSnapshot: Decodable, Identifiable {
+    let id: String
+    let type: String
+    let mode: String
+    let resolvedMode: String
+    let reason: String
+    let priority: Int
+    let startedAt: TimeInterval
+    let expiresAt: Int?
+    let source: String
+}
+
+struct RuleSnapshot: Decodable, Identifiable {
+    let id: String
+    let type: String
+    let value: String
+    let mode: String
+    let reason: String
+    let priority: Int
 }
 
 struct CPUTemperaturePoint: Codable, Identifiable, Equatable {
@@ -169,6 +219,44 @@ struct CPUTemperaturePoint: Codable, Identifiable, Equatable {
     let value: Double
 
     var id: TimeInterval { timestamp }
+}
+
+enum OnboardingStep: Int, CaseIterable {
+    case welcome
+    case requiredSetup
+    case recommendedSetup
+    case optionalSetup
+    case ready
+
+    var title: String {
+        switch self {
+        case .welcome: return "Welcome"
+        case .requiredSetup: return "Required Setup"
+        case .recommendedSetup: return "Recommended"
+        case .optionalSetup: return "Optional"
+        case .ready: return "Ready"
+        }
+    }
+}
+
+struct OnboardingCompletionRecord: Codable {
+    let version: Int
+    let completedAt: TimeInterval
+    let sleepControlConfiguredAtCompletion: Bool
+    let automaticProtectionEnabled: Bool
+    let chosenDefaultMode: String
+}
+
+func loadOnboardingCompletionRecord() -> OnboardingCompletionRecord? {
+    guard let data = FileManager.default.contents(atPath: ONBOARDING_STATE_PATH) else { return nil }
+    return try? JSONDecoder().decode(OnboardingCompletionRecord.self, from: data)
+}
+
+func saveOnboardingCompletionRecord(_ record: OnboardingCompletionRecord) {
+    let url = URL(fileURLWithPath: ONBOARDING_STATE_PATH)
+    try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    guard let data = try? JSONEncoder().encode(record) else { return }
+    try? data.write(to: url, options: [.atomic])
 }
 
 func getBattery() -> BatteryInfo {
@@ -483,6 +571,20 @@ func formatSettingValue(_ key: String, value: Int) -> String {
     }
 }
 
+func formatModeLabel(_ mode: String) -> String {
+    switch mode {
+    case "running": return "Keep Running"
+    case "presenting": return "Keep Presenting"
+    case "agent-safe": return "Agent Safe"
+    default: return mode
+    }
+}
+
+func truncateForMenu(_ value: String, limit: Int = 90) -> String {
+    guard value.count > limit else { return value }
+    return String(value.prefix(limit - 1)) + "…"
+}
+
 // MARK: - ViewModel
 
 class AwakeViewModel: ObservableObject {
@@ -530,6 +632,17 @@ class AwakeViewModel: ObservableObject {
     @Published var codexDetected: Bool = false
     @Published var codexConfigured: Bool = false
     @Published var showOnboarding: Bool = false
+    @Published var defaultMode: String = "agent-safe"
+    @Published var effectiveMode: String = ""
+    @Published var effectiveResolvedMode: String = ""
+    @Published var effectiveReason: String = ""
+    @Published var whyAwakeText: String = "Normal sleep. No active leases."
+    @Published var restorePlanText: String = ""
+    @Published var leaseCount: Int = 0
+    @Published var ruleCount: Int = 0
+    @Published var activeLeases: [LeaseSnapshot] = []
+    @Published var configuredRules: [RuleSnapshot] = []
+    @Published var warnings: [String] = []
 
     private var prevState: [String: String] = [:]
     private var timer: AnyCancellable?
@@ -541,6 +654,19 @@ class AwakeViewModel: ObservableObject {
 
     var onStateChange: ((String) -> Void)?
     var onMenuDataUpdate: ((MenuSnapshot) -> Void)?
+
+    var appliedModeLabel: String {
+        if !isNosleep {
+            return "Normal Sleep"
+        }
+        if !effectiveResolvedMode.isEmpty {
+            return formatModeLabel(effectiveResolvedMode)
+        }
+        if !effectiveMode.isEmpty {
+            return formatModeLabel(effectiveMode)
+        }
+        return formatModeLabel(defaultMode)
+    }
 
     init() {
         allowDisplaySleep = FileManager.default.fileExists(atPath: DISPLAY_SLEEP_FILE)
@@ -904,6 +1030,9 @@ class AwakeViewModel: ObservableObject {
         } else if isTimer {
             snap.timerText = "active"
         }
+        snap.modeText = appliedModeLabel
+        snap.whyText = truncateForMenu(whyAwakeText)
+        snap.warningCount = warnings.count
         onMenuDataUpdate?(snap)
     }
 
@@ -914,12 +1043,27 @@ class AwakeViewModel: ObservableObject {
         claudeConfigured = snapshot.claudeConfigured
         codexDetected = snapshot.codexDetected
         codexConfigured = snapshot.codexConfigured
+        defaultMode = snapshot.defaultMode ?? defaultMode
+        effectiveMode = snapshot.effectiveMode ?? ""
+        effectiveResolvedMode = snapshot.effectiveResolvedMode ?? ""
+        effectiveReason = snapshot.effectiveReason ?? ""
+        whyAwakeText = snapshot.whyAwake ?? whyAwakeText
+        restorePlanText = snapshot.restorePlan ?? ""
+        leaseCount = snapshot.leaseCount ?? 0
+        ruleCount = snapshot.ruleCount ?? 0
+        activeLeases = snapshot.leases ?? []
+        configuredRules = snapshot.rules ?? []
+        warnings = snapshot.warnings ?? []
         cpuTempNeedsSetup = !temperatureConfigured && cpuTempNeedsSetup
 
         if !onboardingEvaluated {
             onboardingEvaluated = true
             showOnboarding = needsOnboarding
         }
+    }
+
+    func setDefaultMode(_ mode: String) {
+        runAction("Setting mode to \(formatModeLabel(mode))", AWAKE_CMD, ["mode", "set", mode])
     }
 
     var needsOnboarding: Bool {
@@ -1041,13 +1185,7 @@ class AwakeViewModel: ObservableObject {
     }
 
     func cancelTimer() {
-        if let pidStr = readFile(FOR_PID_FILE), let pid = Int32(pidStr) {
-            kill(pid, SIGTERM)
-        }
-        try? FileManager.default.removeItem(atPath: FOR_PID_FILE)
-        try? FileManager.default.removeItem(atPath: FOR_END_FILE)
-        addLog("Timer cancelled")
-        refreshAsync()
+        runAction("Cancelling timer", AWAKE_CMD, ["cancel-timer"])
     }
 
     func startDaemon() { runAction("Starting daemon", AWAKE_CMD, ["start"]) }
@@ -1200,10 +1338,13 @@ struct InfoPopoverButton: View {
 
 struct TemperatureSparkline: View {
     let samples: [CPUTemperaturePoint]
+    @State private var hoverX: CGFloat?
 
     var body: some View {
         GeometryReader { geo in
-            let points = normalizedPoints(in: geo.size)
+            let plotted = plottedSamples(in: geo.size)
+            let points = plotted.map(\.point)
+            let hovered = nearestPlottedSample(to: hoverX, in: plotted)
 
             ZStack {
                 RoundedRectangle(cornerRadius: 10)
@@ -1231,7 +1372,7 @@ struct TemperatureSparkline: View {
                     }
                     .fill(
                         LinearGradient(
-                            colors: [Color.green.opacity(0.22), Color.orange.opacity(0.08), Color.clear],
+                            colors: [Color.red.opacity(0.12), Color.orange.opacity(0.08), Color.clear],
                             startPoint: .top,
                             endPoint: .bottom
                         )
@@ -1246,27 +1387,87 @@ struct TemperatureSparkline: View {
                     .stroke(
                         LinearGradient(
                             colors: [Color.green, Color.yellow, Color.orange, Color.red.opacity(0.85)],
-                            startPoint: .leading,
-                            endPoint: .trailing
+                            startPoint: .bottom,
+                            endPoint: .top
                         ),
                         style: StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round)
                     )
 
-                    Circle()
-                        .fill(Color.white)
-                        .overlay(Circle().stroke(Color.orange, lineWidth: 2))
-                        .frame(width: 8, height: 8)
-                        .position(points.last!)
+                    if let hovered {
+                        Path { path in
+                            path.move(to: CGPoint(x: hovered.point.x, y: 0))
+                            path.addLine(to: CGPoint(x: hovered.point.x, y: geo.size.height))
+                        }
+                        .stroke(Color.primary.opacity(0.16), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+
+                        Circle()
+                            .fill(Color.white)
+                            .overlay(Circle().stroke(Color.orange, lineWidth: 2))
+                            .frame(width: 9, height: 9)
+                            .position(hovered.point)
+
+                        hoverBadge(for: hovered.sample, size: geo.size, x: hovered.point.x)
+                    } else {
+                        Circle()
+                            .fill(Color.white)
+                            .overlay(Circle().stroke(Color.orange, lineWidth: 2))
+                            .frame(width: 8, height: 8)
+                            .position(points.last!)
+                    }
                 } else {
                     Text("Waiting for CPU temperature history")
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
                 }
             }
+            .contentShape(Rectangle())
+            .onContinuousHover(coordinateSpace: .local) { phase in
+                switch phase {
+                case .active(let location):
+                    hoverX = location.x
+                case .ended:
+                    hoverX = nil
+                }
+            }
         }
     }
 
-    private func normalizedPoints(in size: CGSize) -> [CGPoint] {
+    @ViewBuilder
+    private func hoverBadge(for sample: CPUTemperaturePoint, size: CGSize, x: CGFloat) -> some View {
+        let anchorX = min(max(x, 72), max(size.width - 72, 72))
+        VStack(alignment: .leading, spacing: 2) {
+            Text(hoverTimeString(sample.timestamp))
+                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                .foregroundColor(.secondary)
+            Text("\(Int(round(sample.value)))°C")
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundColor(.primary)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color(nsColor: .windowBackgroundColor).opacity(0.96))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+        .position(x: anchorX, y: 14)
+    }
+
+    private func hoverTimeString(_ timestamp: TimeInterval) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        return formatter.string(from: Date(timeIntervalSince1970: timestamp))
+    }
+
+    private func nearestPlottedSample(to hoverX: CGFloat?, in plotted: [(sample: CPUTemperaturePoint, point: CGPoint)]) -> (sample: CPUTemperaturePoint, point: CGPoint)? {
+        guard let hoverX, !plotted.isEmpty else { return nil }
+        return plotted.min(by: { abs($0.point.x - hoverX) < abs($1.point.x - hoverX) })
+    }
+
+    private func plottedSamples(in size: CGSize) -> [(sample: CPUTemperaturePoint, point: CGPoint)] {
         guard !samples.isEmpty else { return [] }
         let cutoff = Date().timeIntervalSince1970 - CPU_TEMP_HISTORY_WINDOW
         let filtered = samples.filter { $0.timestamp >= cutoff }.sorted { $0.timestamp < $1.timestamp }
@@ -1286,7 +1487,7 @@ struct TemperatureSparkline: View {
             let x = ((sample.timestamp - minTime) / (maxTime - minTime)) * chartWidth + 1
             let normalized = (sample.value - minY) / (maxY - minY)
             let y = chartHeight - (normalized * chartHeight) + 1
-            return CGPoint(x: x, y: y)
+            return (sample: sample, point: CGPoint(x: x, y: y))
         }
     }
 }
@@ -1367,6 +1568,8 @@ struct ContentView: View {
             ScrollView(.vertical, showsIndicators: true) {
                 VStack(alignment: .leading, spacing: 0) {
                     controlsSection.padding(16)
+                    Divider().padding(.horizontal, 16)
+                    whySection.padding(16)
                     Divider().padding(.horizontal, 16)
                     statusSection.padding(16)
                     Divider().padding(.horizontal, 16)
@@ -1791,6 +1994,29 @@ struct ContentView: View {
             }
 
             HStack(spacing: 6) {
+                Text("Mode")
+                    .font(.system(size: 12, weight: .medium))
+                InfoPopoverButton(text: "Default wake mode for daemon sessions, timers, and `awake run` commands.\n\nAgent Safe chooses the safer default automatically: it becomes Keep Presenting when display sleep is not allowed, and Keep Running when display sleep is allowed.\n\nKeep Running keeps the Mac awake while still allowing the display to sleep. Keep Presenting keeps both the Mac and the display awake.")
+
+                Picker("", selection: Binding(
+                    get: { vm.defaultMode },
+                    set: { vm.setDefaultMode($0) }
+                )) {
+                    Text("Agent Safe").tag("agent-safe")
+                    Text("Keep Running").tag("running")
+                    Text("Keep Presenting").tag("presenting")
+                }
+                .labelsHidden()
+                .frame(width: 170)
+
+                Spacer()
+            }
+
+            Text("Default mode for daemon, timers, and command sessions.")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+
+            HStack(spacing: 6) {
                 Text("Sleep in")
                     .font(.system(size: 12, weight: .medium))
 
@@ -1967,6 +2193,89 @@ struct ContentView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
+        }
+    }
+
+    private var whySection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionLabel(
+                text: "Why Awake",
+                help: "The reason Awake is currently preventing sleep.\n\nExample: a daemon agent lease, a manual timer, or a running command can all hold the Mac awake at the same time. Awake resolves that to one effective mode and shows the active owners here."
+            )
+
+            VStack(alignment: .leading, spacing: 8) {
+                StatRow(
+                    label: "Effective mode",
+                    value: vm.appliedModeLabel,
+                    valueColor: vm.isNosleep ? .green : .secondary,
+                    mono: false
+                )
+
+                Text(vm.whyAwakeText)
+                    .font(.system(size: 11))
+                    .foregroundColor(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if !vm.restorePlanText.isEmpty {
+                    Text(vm.restorePlanText)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                HStack(spacing: 8) {
+                    TagBadge(text: "\(vm.leaseCount) leases", color: vm.leaseCount > 0 ? .green : .secondary)
+                    TagBadge(text: "\(vm.ruleCount) rules", color: vm.ruleCount > 0 ? .orange : .secondary)
+                }
+
+                if !vm.warnings.isEmpty {
+                    ForEach(vm.warnings, id: \.self) { warning in
+                        Text(warning)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.orange)
+                    }
+                }
+
+                if !vm.activeLeases.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(vm.activeLeases.sorted(by: { lhs, rhs in
+                            if lhs.priority == rhs.priority { return lhs.startedAt > rhs.startedAt }
+                            return lhs.priority > rhs.priority
+                        })) { lease in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("\(lease.id) • \(formatModeLabel(lease.mode))")
+                                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                                Text(lease.reason)
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                }
+
+                if !vm.configuredRules.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Configured rules")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.secondary)
+                        ForEach(vm.configuredRules.prefix(4)) { rule in
+                            Text("\(rule.type)=\(rule.value) → \(formatModeLabel(rule.mode))")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(Color.orange.opacity(0.05))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(Color.orange.opacity(0.14), lineWidth: 1)
+            )
         }
     }
 
@@ -2151,6 +2460,9 @@ struct MenuSnapshot {
     var isDaemon: Bool = false
     var isTimer: Bool = false
     var timerText: String = ""
+    var modeText: String = ""
+    var whyText: String = ""
+    var warningCount: Int = 0
 }
 
 // MARK: - App Delegate
@@ -2164,6 +2476,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var iconTimer: AnyCancellable?
     var cachedMenu = MenuSnapshot()
     private var pendingPromotionWorkItem: DispatchWorkItem?
+
+    override init() {
+        super.init()
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleGetURLEvent(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kInternetEventClass),
+            andEventID: AEEventID(kAEGetURL)
+        )
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
@@ -2179,11 +2501,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.imagePosition = .imageLeading
             button.font = NSFont.monospacedSystemFont(ofSize: 9, weight: .medium)
             button.title = ""
-            // Left-click = open panel, Right-click = menu
+            // Left-click = toggle Awake, Right-click = open panel
             button.target = self
             button.action = #selector(statusItemClicked(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-            button.toolTip = "Awake\nLeft-click: open panel\nRight-click: quick menu\nHotkey: Ctrl+Shift+A"
+            button.toolTip = "Awake\nLeft-click: toggle awake\nRight-click: open panel\nHotkey: Ctrl+Shift+A"
         }
 
         // No menu assigned — we show it programmatically on right-click
@@ -2226,6 +2548,51 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.showPanel()
         }
         scheduleStatusItemPromotion()
+    }
+
+    @objc func handleGetURLEvent(_ event: NSAppleEventDescriptor, withReplyEvent replyEvent: NSAppleEventDescriptor) {
+        guard let raw = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
+              let url = URL(string: raw) else { return }
+        handleAutomationURL(url)
+    }
+
+    private func handleAutomationURL(_ url: URL) {
+        let action = url.host ?? url.pathComponents.dropFirst().first ?? ""
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let queryItems = components?.queryItems ?? []
+
+        func queryValue(_ name: String) -> String? {
+            queryItems.first(where: { $0.name == name })?.value
+        }
+
+        switch action {
+        case "open", "panel":
+            DispatchQueue.main.async { self.showPanel() }
+        case "toggle":
+            let isNosleep = (readFile(STATE_FILE) ?? "").hasPrefix("nosleep")
+            DispatchQueue.global(qos: .userInitiated).async {
+                runCommand(AWAKE_CMD, [isNosleep ? "yessleep" : "on"])
+            }
+        case "timer":
+            let duration = queryValue("duration")
+                ?? queryValue("minutes").map { "\($0)m" }
+                ?? queryValue("hours").map { "\($0)h" }
+            guard let duration else { return }
+            DispatchQueue.global(qos: .userInitiated).async {
+                runCommand(AWAKE_CMD, ["for", duration])
+            }
+        case "mode":
+            guard let mode = queryValue("name") ?? queryValue("mode") else { return }
+            DispatchQueue.global(qos: .userInitiated).async {
+                runCommand(AWAKE_CMD, ["mode", "set", mode])
+            }
+        case "sleep":
+            DispatchQueue.global(qos: .userInitiated).async {
+                runCommand(AWAKE_CMD, ["sleep"], timeout: 10)
+            }
+        default:
+            break
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -2331,9 +2698,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func statusItemClicked(_ sender: NSStatusBarButton) {
         guard let event = NSApp.currentEvent else { return }
         if event.type == .rightMouseUp {
-            showStatusMenu()
-        } else {
             showPanel()
+        } else {
+            toggleAwakeFromStatusItem()
+        }
+    }
+
+    private func toggleAwakeFromStatusItem() {
+        let state = readFile(STATE_FILE) ?? "unknown"
+        let isNosleep = state.hasPrefix("nosleep")
+        let command: String
+        if isNosleep {
+            command = "yessleep"
+        } else if FileManager.default.fileExists(atPath: DISPLAY_SLEEP_FILE) {
+            command = "nosleep-display"
+        } else {
+            command = "nosleep"
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            runCommand(AWAKE_CMD, [command])
+            DispatchQueue.main.async { [weak self] in self?.refreshIcon() }
         }
     }
 
@@ -2361,7 +2746,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 attributes: textAttributes
             )
             let uptimeSuffix = uptimeText.isEmpty ? "" : " (\(uptimeText))"
-            button.toolTip = "Awake\nNosleep active\(uptimeSuffix)\nLeft-click: open panel\nRight-click: quick menu\nHotkey: Ctrl+Shift+A"
+            button.toolTip = "Awake\nNosleep active\(uptimeSuffix)\nLeft-click: toggle awake\nRight-click: open panel\nHotkey: Ctrl+Shift+A"
         } else {
             let img = NSImage(systemSymbolName: "moon.zzz", accessibilityDescription: "sleep ok")
             img?.isTemplate = true
@@ -2370,7 +2755,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.contentTintColor = nil
             button.title = ""
             button.attributedTitle = NSAttributedString(string: "", attributes: textAttributes)
-            button.toolTip = "Awake\nNormal sleep\nLeft-click: open panel\nRight-click: quick menu\nHotkey: Ctrl+Shift+A"
+            button.toolTip = "Awake\nNormal sleep\nLeft-click: toggle awake\nRight-click: open panel\nHotkey: Ctrl+Shift+A"
         }
     }
 
@@ -2444,6 +2829,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(timerItem)
         }
 
+        if !s.modeText.isEmpty {
+            let modeItem = NSMenuItem(title: "  Mode: \(s.modeText)", action: nil, keyEquivalent: "")
+            modeItem.isEnabled = false
+            menu.addItem(modeItem)
+        }
+
+        if !s.whyText.isEmpty {
+            let whyItem = NSMenuItem(title: "  Why: \(s.whyText)", action: nil, keyEquivalent: "")
+            whyItem.isEnabled = false
+            menu.addItem(whyItem)
+        }
+
+        if s.warningCount > 0 {
+            let warningItem = NSMenuItem(title: "  Warnings: \(s.warningCount)", action: nil, keyEquivalent: "")
+            warningItem.isEnabled = false
+            menu.addItem(warningItem)
+        }
+
         menu.addItem(NSMenuItem.separator())
 
         // --- Quick controls ---
@@ -2504,11 +2907,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func menuTimerCancel() {
-        if let pidStr = readFile(FOR_PID_FILE), let pid = Int32(pidStr) {
-            kill(pid, SIGTERM)
-        }
-        try? FileManager.default.removeItem(atPath: FOR_PID_FILE)
-        try? FileManager.default.removeItem(atPath: FOR_END_FILE)
+        DispatchQueue.global(qos: .userInitiated).async { runCommand(AWAKE_CMD, ["cancel-timer"]) }
     }
 
     @objc func menuStartDaemon() {

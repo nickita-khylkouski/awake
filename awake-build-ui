@@ -12,25 +12,33 @@ APP_DIR="$HOME/.local/bin/Awake.app/Contents"
 APP_ROOT="$HOME/.local/bin/Awake.app"
 RESOURCE_BIN_DIR="$APP_DIR/Resources/bin"
 SCRIPT_SOURCE_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+REPO_SRC_FILE="$SCRIPT_SOURCE_DIR/ui/main.swift"
 ICON_SCRIPT="$SCRIPT_SOURCE_DIR/awake-build-icon"
 ICON_FILE="$APP_DIR/Resources/Awake.icns"
 
 log() { echo "[awake-build-ui] $(date '+%H:%M:%S') $*"; }
 
-# --- 1. Check source exists ---
+# --- 1. Prefer repo source when available ---
+
+if [ -f "$REPO_SRC_FILE" ]; then
+    mkdir -p "$SRC_DIR"
+    cp "$REPO_SRC_FILE" "$SRC_FILE"
+fi
+
+# --- 2. Check source exists ---
 
 if [ ! -f "$SRC_FILE" ]; then
     log "ERROR: $SRC_FILE not found"
     exit 1
 fi
 
-# --- 2. Compile ---
+# --- 3. Compile ---
 
 log "Compiling $SRC_FILE..."
 swiftc -framework AppKit -framework SwiftUI -framework UserNotifications -framework IOKit -O -o "$BINARY" "$SRC_FILE"
 log "Compiled: $(ls -lh "$BINARY" | awk '{print $5}') arm64 binary"
 
-# --- 3. Create/update app bundle ---
+# --- 4. Create/update app bundle ---
 
 mkdir -p "$APP_DIR/MacOS" "$APP_DIR/Resources" "$RESOURCE_BIN_DIR"
 
@@ -73,6 +81,17 @@ cat > "$APP_DIR/Info.plist" << 'PLIST'
     <string>Awake</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>com.awake.urls</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>awake</string>
+            </array>
+        </dict>
+    </array>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>
@@ -86,13 +105,18 @@ if [ -f "$APP_DIR/MacOS/awake-ui-launcher" ]; then
     log "Removed old Python launcher"
 fi
 
-# --- 4. Ad-hoc code sign (required for `open` to launch reliably) ---
+# --- 5. Ad-hoc code sign (required for `open` to launch reliably) ---
 
 codesign --force --sign - "$APP_DIR/MacOS/AwakeUI" 2>/dev/null
 codesign --force --sign - "$APP_ROOT" 2>/dev/null
 log "Ad-hoc signed binary and bundle"
 
-# --- 5. Touch bundle to refresh LaunchServices ---
+# --- 6. Register URL scheme + refresh LaunchServices ---
+
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [ -x "$LSREGISTER" ]; then
+    "$LSREGISTER" -f "$APP_ROOT" >/dev/null 2>&1 || true
+fi
 
 touch "$APP_ROOT"
 log "Done. Run: open ~/.local/bin/Awake.app"

@@ -60,6 +60,10 @@ status_json="$("$REPO_DIR/awake" setup status-json)"
 [[ "$status_json" == *'"claudeConfigured":false'* ]]
 [[ "$status_json" == *'"codexDetected":true'* ]]
 [[ "$status_json" == *'"codexConfigured":false'* ]]
+[[ "$status_json" == *'"defaultMode":"agent-safe"'* ]]
+[[ "$status_json" == *'"leases":['* ]]
+[[ "$status_json" == *'"rules":['* ]]
+[[ "$status_json" == *'"whyAwake":"Normal sleep. No active leases."'* ]]
 
 "$REPO_DIR/awake" setup claude >/dev/null
 "$REPO_DIR/awake" setup codex >/dev/null
@@ -72,5 +76,6 @@ assert_contains 'notify = "'"$TEST_HOME"'/.local/bin/awake-notify"' "$TEST_HOME/
 status_json="$("$REPO_DIR/awake" setup status-json)"
 [[ "$status_json" == *'"claudeConfigured":true'* ]]
 [[ "$status_json" == *'"codexConfigured":true'* ]]
+[[ "$status_json" == *'"warnings":['* ]]
 
 echo "setup command tests passed"

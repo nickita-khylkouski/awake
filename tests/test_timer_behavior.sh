@@ -207,13 +207,20 @@ setup_state() {
     FOR_PID_FILE="$dir/awake-for.pid"
     FOR_END_FILE="$dir/awake-for-end"
     FOR_TOKEN_FILE="$dir/awake-for-token"
+    DISPLAY_SLEEP_FILE="$dir/awake-display-sleep"
+    LEASES_DIR="$dir/leases"
+    RULES_DIR="$dir/rules.d"
     BASELINE_FILE="$dir/power-baseline.json"
+    MODE_FILE="$dir/default-mode"
     DAEMON_LOCK_DIR="$dir/daemon-lock"
     DAEMON_OWNER_FILE="$DAEMON_LOCK_DIR/pid"
+    WHY_FILE="$dir/awake-why"
     : > "$PMSET_LOG"
     set_agents_active 0
     rm -f /tmp/awake-claude-* /tmp/awake-codex-* 2>/dev/null || true
     seed_pmset_state
+    mkdir -p "$LEASES_DIR" "$RULES_DIR"
+    echo "agent-safe" > "$MODE_FILE"
 }
 
 assert_equals() {
@@ -311,6 +318,18 @@ test_manual_yessleep_cancels_timer() {
     assert_not_contains "pmset sleepnow" "$PMSET_LOG"
 }
 
+test_cancel_timer_command_clears_lease() {
+    setup_state cancel-command
+    set_agents_active 0
+    cmd_for 1 >/dev/null
+    sleep 0.2
+    cmd_cancel_timer >/dev/null
+    sleep 1.1
+    assert_equals "normal" "$(cat "$STATE_FILE")"
+    [ ! -d "$LEASES_DIR/manual-timer" ]
+    [ ! -f "$FOR_PID_FILE" ]
+}
+
 test_timer_waits_until_agents_stop_before_restoring() {
     setup_state wait-for-agents
     set_agents_active 1
@@ -382,6 +401,7 @@ test_temp_json() {
 test_timer_restores_sleep_ok
 test_timer_stays_awake_when_agents_active
 test_manual_yessleep_cancels_timer
+test_cancel_timer_command_clears_lease
 test_timer_waits_until_agents_stop_before_restoring
 test_restore_without_baseline_falls_back
 test_settings_apply_inactive

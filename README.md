@@ -213,19 +213,10 @@ The SwiftUI menu bar app shows an icon in your menu bar:
 - **Moon icon** — normal sleep mode
 
 **Interactions:**
-- **Left-click** → instantly toggles nosleep on/off (no menu, no confirmation)
-- **Right-click** → opens dropdown with:
-  - Status (nosleep/normal, uptime)
-  - Active agents (claude(5), codex(2), etc.)
-  - Active hooks (session IDs with age)
-  - Battery percentage
-  - Timer remaining
-  - Nosleep ON / Sleep OK toggle
-  - Timer submenu (15m, 30m, 1h, 2h, 4h, 8h, cancel)
-  - Start/Stop Daemon
-  - Open Panel, Sleep Now, Quit
+- **Left-click** → toggles Awake on/off
+- **Right-click** → opens the main panel
 
-**Panel** (toggle with `Ctrl+Shift+A` or right-click → Open Panel):
+**Panel** (toggle with `Ctrl+Shift+A` or right-click on the menu bar icon):
 - Full dashboard with hero status, pulsing animation when active
 - Agent and hook monitoring
 - All controls: nosleep toggle, timer, daemon start/stop, sleep now
