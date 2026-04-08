@@ -8,6 +8,10 @@
 
 ![awake hero](./assets/awake-hero.svg)
 
+[Download the macOS app](https://github.com/nickita-khylkouski/awake/releases/latest)
+·
+[Install from npm](https://www.npmjs.com/package/awake-agent)
+
 `awake` keeps your Mac alive while coding agents are actually working. It prevents idle sleep and lid-close sleep, restores your normal power settings when work stops, and gives you a native menu bar app plus a CLI for manual control.
 
 Unlike generic keep-awake tools, `awake` is built around long-running AI coding sessions. It can watch for Claude Code, Codex, Aider, Copilot, Amp, and similar tools, activate automatically, respect timers and manual sessions, and fail back to normal sleep cleanly.
@@ -21,6 +25,23 @@ Unlike generic keep-awake tools, `awake` is built around long-running AI coding 
 - Battery protection and automatic restore behavior
 - Hook wiring for Claude Code and Codex
 - Open source, scriptable, and local-first
+
+## Download
+
+If you just want the app:
+
+- Download the latest `.app` zip from [GitHub Releases](https://github.com/nickita-khylkouski/awake/releases/latest)
+- Unzip `Awake-macOS.zip`
+- Move `Awake.app` wherever you keep apps
+- Launch it once, then follow the setup prompts
+
+If you want the CLI + repo workflow, use the install steps below instead.
+
+## Preview
+
+Actual app panel:
+
+![Awake panel screenshot](./assets/awake-panel.png)
 
 ## Quick start
 
