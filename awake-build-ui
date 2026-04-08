@@ -8,6 +8,7 @@ set -euo pipefail
 SRC_DIR="$HOME/.local/bin/AwakeApp"
 SRC_FILE="$SRC_DIR/main.swift"
 BINARY="$SRC_DIR/AwakeUI"
+BUILD_HASH_FILE="$SRC_DIR/main.swift.sha256"
 APP_DIR="$HOME/.local/bin/Awake.app/Contents"
 APP_ROOT="$HOME/.local/bin/Awake.app"
 RESOURCE_BIN_DIR="$APP_DIR/Resources/bin"
@@ -32,11 +33,26 @@ if [ ! -f "$SRC_FILE" ]; then
     exit 1
 fi
 
+# --- 3. Decide whether a rebuild is needed ---
+
+SOURCE_HASH="$(shasum -a 256 "$SRC_FILE" | awk '{print $1}')"
+PREV_HASH=""
+[ -f "$BUILD_HASH_FILE" ] && PREV_HASH="$(cat "$BUILD_HASH_FILE" 2>/dev/null || true)"
+NEEDS_COMPILE=true
+if [ -x "$BINARY" ] && [ "$SOURCE_HASH" = "$PREV_HASH" ]; then
+    NEEDS_COMPILE=false
+fi
+
 # --- 3. Compile ---
 
-log "Compiling $SRC_FILE..."
-swiftc -framework AppKit -framework SwiftUI -framework UserNotifications -framework IOKit -O -o "$BINARY" "$SRC_FILE"
-log "Compiled: $(ls -lh "$BINARY" | awk '{print $5}') arm64 binary"
+if $NEEDS_COMPILE; then
+    log "Compiling $SRC_FILE... (first build can take ~20-40s)"
+    swiftc -framework AppKit -framework SwiftUI -framework UserNotifications -framework IOKit -o "$BINARY" "$SRC_FILE"
+    printf '%s\n' "$SOURCE_HASH" > "$BUILD_HASH_FILE"
+    log "Compiled: $(ls -lh "$BINARY" | awk '{print $5}') arm64 binary"
+else
+    log "Source unchanged; skipping Swift compile"
+fi
 
 # --- 4. Create/update app bundle ---
 

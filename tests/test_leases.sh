@@ -62,7 +62,14 @@ read_key() {
 }
 
 if [ "${1:-}" = "-g" ] && [ "${2:-}" = "batt" ]; then
-    echo "Now drawing from 'AC Power'"
+    pct="$(read_key battery-pct)"
+    if [ -f "$state_dir/on-battery" ]; then
+        echo "Now drawing from 'Battery Power'"
+        echo " -InternalBattery-0 (id=1234567)\t${pct}%; discharging; 2:00 remaining"
+    else
+        echo "Now drawing from 'AC Power'"
+        echo " -InternalBattery-0 (id=1234567)\t${pct}%; charging; 2:00 remaining"
+    fi
     exit 0
 fi
 
@@ -148,11 +155,22 @@ setup_state() {
     DAEMON_OWNER_FILE="$DAEMON_LOCK_DIR/pid"
     mkdir -p "$LEASES_DIR" "$RULES_DIR"
     echo "agent-safe" > "$MODE_FILE"
+    : > "$PMSET_LOG"
     echo 0 > "$PMSET_STATE_DIR/disablesleep"
+    echo 50 > "$PMSET_STATE_DIR/battery-pct"
+    rm -f "$PMSET_STATE_DIR/on-battery"
     echo 10 > "$PMSET_STATE_DIR/battery.sleep"
     echo 10 > "$PMSET_STATE_DIR/ac.sleep"
     echo 5 > "$PMSET_STATE_DIR/battery.displaysleep"
     echo 5 > "$PMSET_STATE_DIR/ac.displaysleep"
+}
+
+set_on_battery() {
+    touch "$PMSET_STATE_DIR/on-battery"
+}
+
+set_charging() {
+    rm -f "$PMSET_STATE_DIR/on-battery"
 }
 
 assert_equals() {
@@ -199,5 +217,22 @@ lease_create_or_update "daemon-agent" "daemon" "agent-safe" "Detected active cod
 reconcile_effective_state
 [ ! -d "$LEASES_DIR/daemon-agent" ]
 assert_equals "normal" "$(cat "$STATE_FILE")"
+
+setup_state
+set_on_battery
+echo 4 > "$PMSET_STATE_DIR/battery-pct"
+lease_create_or_update "manual-toggle" "manual" "presenting" "Manual lease" 100 "" "test"
+reconcile_effective_state
+[ ! -d "$LEASES_DIR/manual-toggle" ]
+assert_equals "normal" "$(cat "$STATE_FILE")"
+grep -q "pmset sleepnow" "$PMSET_LOG"
+
+setup_state
+set_charging
+echo 4 > "$PMSET_STATE_DIR/battery-pct"
+lease_create_or_update "manual-toggle" "manual" "presenting" "Manual lease" 100 "" "test"
+reconcile_effective_state
+[ -d "$LEASES_DIR/manual-toggle" ]
+assert_equals "nosleep-full" "$(cat "$STATE_FILE")"
 
 echo "lease behavior tests passed"

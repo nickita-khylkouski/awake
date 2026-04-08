@@ -1642,6 +1642,13 @@ struct ContentView: View {
             vm.onMenuDataUpdate = { snap in
                 AppDelegate.shared?.cachedMenu = snap
             }
+            AppDelegate.shared?.updatePanelPersistence(isPersistent: vm.showOnboarding || vm.isBusy)
+        }
+        .onChange(of: vm.showOnboarding) { _, value in
+            AppDelegate.shared?.updatePanelPersistence(isPersistent: value || vm.isBusy)
+        }
+        .onChange(of: vm.isBusy) { _, value in
+            AppDelegate.shared?.updatePanelPersistence(isPersistent: vm.showOnboarding || value)
         }
     }
 
@@ -1699,6 +1706,8 @@ struct ContentView: View {
                         onboardingAudienceCard(option)
                     }
                 }
+
+                onboardingMenuBarHintCard
 
                 onboardingStep(
                     title: "Allow sleep control",
@@ -1783,6 +1792,36 @@ struct ContentView: View {
             }
             .padding(20)
         }
+    }
+
+    private var onboardingMenuBarHintCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Find Awake in your menu bar")
+                .font(.system(size: 13, weight: .semibold))
+
+            MenuBarHintCard()
+
+            HStack(spacing: 10) {
+                Button("Show icon in menu bar") {
+                    AppDelegate.shared?.showStatusItemHint()
+                }
+                .buttonStyle(.bordered)
+
+                Text("Left-click toggles awake. Right-click opens the panel.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(Color.blue.opacity(0.14), lineWidth: 1)
+        )
     }
 
     @ViewBuilder
@@ -2637,14 +2676,130 @@ struct ContentView: View {
     }
 }
 
+private struct MenuBarHintCard: View {
+    @State private var pulse = false
+    @State private var pointerLift = false
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            RoundedRectangle(cornerRadius: 16)
+                .fill(
+                    LinearGradient(
+                        colors: [Color(red: 0.10, green: 0.12, blue: 0.20), Color(red: 0.14, green: 0.18, blue: 0.30)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+
+            HStack(spacing: 10) {
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(.white.opacity(0.18))
+                    .frame(width: 56, height: 10)
+
+                Spacer(minLength: 0)
+
+                Image(systemName: "wifi")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.75))
+
+                Image(systemName: "battery.75")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.75))
+
+                ZStack {
+                    Circle()
+                        .fill(Color.green.opacity(0.24))
+                        .frame(width: pulse ? 34 : 26, height: pulse ? 34 : 26)
+                        .overlay(
+                            Circle()
+                                .stroke(Color.green.opacity(0.45), lineWidth: 1.5)
+                        )
+                        .scaleEffect(pulse ? 1.12 : 0.88)
+
+                    Circle()
+                        .fill(Color.white)
+                        .frame(width: 22, height: 22)
+
+                    Image(systemName: "bolt.fill")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(Color.green)
+                }
+                .overlay(alignment: .bottom) {
+                    Image(systemName: "cursorarrow.click.2")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.white)
+                        .rotationEffect(.degrees(-14))
+                        .offset(x: pointerLift ? -4 : 6, y: pointerLift ? 26 : 34)
+                        .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 12)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Spacer(minLength: 0)
+
+                Text("Awake lives up here in the menu bar.")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
+
+                HStack(spacing: 8) {
+                    onboardingChip(text: "Left click: toggle")
+                    onboardingChip(text: "Right click: open panel")
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+        }
+        .frame(height: 118)
+        .onAppear {
+            withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) {
+                pulse.toggle()
+                pointerLift.toggle()
+            }
+        }
+    }
+
+    private func onboardingChip(text: String) -> some View {
+        Text(text)
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(.white.opacity(0.92))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                Capsule()
+                    .fill(.white.opacity(0.12))
+            )
+    }
+}
+
+private struct StatusItemHintPopoverView: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Awake is here")
+                .font(.system(size: 13, weight: .bold))
+            Text("Look for the bolt or moon icon in your menu bar.\nLeft-click toggles awake. Right-click opens the panel.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .frame(width: 250, alignment: .leading)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+}
+
 // MARK: - Floating Panel
 
 class AwakePanel: NSPanel {
+    var keepVisibleWhenInactive = false
+
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
 
     override func resignMain() {
         super.resignMain()
+        guard !keepVisibleWhenInactive else { return }
         orderOut(nil)
     }
 
@@ -2662,7 +2817,7 @@ class AwakePanel: NSPanel {
         isOpaque = true
         hasShadow = true
         animationBehavior = .utilityWindow
-        hidesOnDeactivate = true
+        hidesOnDeactivate = false
         collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
         minSize = NSSize(width: 300, height: 440)
         maxSize = NSSize(width: 480, height: 800)
@@ -2701,6 +2856,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var iconTimer: AnyCancellable?
     var cachedMenu = MenuSnapshot()
     private var pendingPromotionWorkItem: DispatchWorkItem?
+    private var statusItemHintPopover: NSPopover?
 
     override init() {
         super.init()
@@ -3160,6 +3316,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func showPanelAction() { showPanel() }
+
+    func updatePanelPersistence(isPersistent: Bool) {
+        panel.keepVisibleWhenInactive = isPersistent
+    }
+
+    func showStatusItemHint() {
+        guard let button = statusItem.button else { return }
+
+        statusItemHintPopover?.performClose(nil)
+
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentSize = NSSize(width: 260, height: 92)
+        popover.contentViewController = NSHostingController(rootView: StatusItemHintPopoverView())
+        statusItemHintPopover = popover
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+            self?.statusItemHintPopover?.performClose(nil)
+            self?.statusItemHintPopover = nil
+        }
+    }
 
     @objc func quitApp() { NSApp.terminate(nil) }
 

@@ -56,6 +56,7 @@ FOR_END_FILE="/tmp/awake-for-end"
 FOR_TOKEN_FILE="/tmp/awake-for-token"
 DISPLAY_SLEEP_FILE="/tmp/awake-display-sleep"
 WHY_FILE="/tmp/awake-why"
+BATTERY_GUARD_FILE="/tmp/awake-battery-guard"
 LOG_PREFIX="[awake]"
 
 # --- Helpers ---
@@ -692,6 +693,44 @@ is_charging() {
     on_ac_power
 }
 
+clear_battery_guard_state() {
+    rm -f "$BATTERY_GUARD_FILE"
+}
+
+enforce_battery_guard() {
+    local batt stage=""
+    batt="$(get_battery_pct 2>/dev/null || true)"
+
+    if [ -z "$batt" ] || is_charging; then
+        clear_battery_guard_state
+        return 1
+    fi
+
+    stage="$(read_file_value "$BATTERY_GUARD_FILE" 2>/dev/null || true)"
+
+    if [ "$batt" -le "$BATTERY_CRITICAL" ] 2>/dev/null; then
+        if [ "$stage" != "critical" ]; then
+            log "CRITICAL: Battery at ${batt}% — forcing sleep"
+            notify "awake" "Battery critical (${batt}%). Sleeping now."
+        fi
+        printf 'critical\n' > "$BATTERY_GUARD_FILE"
+        force_sleep
+        return 0
+    fi
+
+    if [ "$batt" -le "$BATTERY_WARN" ] 2>/dev/null; then
+        if [ "$stage" != "warn" ]; then
+            log "WARNING: Battery at ${batt}%"
+            notify "awake" "Battery low (${batt}%). Plug in soon."
+            printf 'warn\n' > "$BATTERY_GUARD_FILE"
+        fi
+        return 1
+    fi
+
+    clear_battery_guard_state
+    return 1
+}
+
 HOOK_STALE_SECONDS=120  # 2 min without heartbeat = idle/dead
 
 fresh_hook_files() {
@@ -1284,7 +1323,11 @@ reconcile_effective_state() {
     local id mode resolved reason
     id="$(best_lease_id 2>/dev/null || true)"
     if [ -z "$id" ]; then
+        clear_battery_guard_state
         restore_normal_sleep_settings
+        return 0
+    fi
+    if enforce_battery_guard; then
         return 0
     fi
     mode="$(lease_field "$id" mode 2>/dev/null || echo agent-safe)"
@@ -1529,27 +1572,13 @@ cmd_daemon() {
     log "Watching: $AGENTS"
 
     local grace_start=0
-    local battery_warned=false
 
     while true; do
-        # --- Battery check (always, regardless of agents) ---
-        local batt=$(get_battery_pct)
-        if [ -n "$batt" ] && ! is_charging; then
-            if [ "$batt" -le "$BATTERY_CRITICAL" ]; then
-                log "CRITICAL: Battery at ${batt}% — forcing sleep"
-                notify "awake" "Battery critical (${batt}%). Sleeping now."
-                force_sleep
-                grace_start=0
-                battery_warned=false
-                sleep "$POLL_INTERVAL"
-                continue
-            elif [ "$batt" -le "$BATTERY_WARN" ] && [ "$battery_warned" = false ]; then
-                log "WARNING: Battery at ${batt}%"
-                notify "awake" "Battery low (${batt}%). Plug in soon."
-                battery_warned=true
-            fi
-        else
-            battery_warned=false  # reset when charging or no battery
+        # --- Battery guard (always, regardless of agent source) ---
+        if [ "$(lease_count)" -gt 0 ] && enforce_battery_guard; then
+            grace_start=0
+            sleep "$POLL_INTERVAL"
+            continue
         fi
 
         sync_rule_leases
@@ -1963,6 +1992,9 @@ cmd_ui() {
 }
 
 cmd_install() {
+    local auto_open=true
+    [ "${AWAKE_INSTALL_NO_OPEN:-0}" = "1" ] && auto_open=false
+
     log "Installing awake..."
 
     mkdir -p "$LOCAL_BIN_DIR" "$LOCAL_APP_SRC_DIR" "$HOME/.config/awake"
@@ -2058,7 +2090,17 @@ CONF
         log "Codex: not installed (skipping)"
     fi
 
-    log "Done. Start with: awake start"
+    if [ -d "$LOCAL_BIN_DIR/Awake.app" ]; then
+        if $auto_open; then
+            log "Opening Awake.app..."
+            open "$LOCAL_BIN_DIR/Awake.app" >/dev/null 2>&1 || true
+            log "Done. Awake.app should open now."
+        else
+            log "Done. Run: open ~/.local/bin/Awake.app"
+        fi
+    else
+        log "Done. Start with: awake start"
+    fi
 }
 
 cmd_uninstall() {

@@ -3,6 +3,7 @@
 AwakeUI
 *.o
 *.d
+dist/
 
 # macOS
 .DS_Store

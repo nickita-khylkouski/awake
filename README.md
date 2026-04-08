@@ -46,12 +46,12 @@ Actual app panel:
 ## Quick start
 
 ```bash
-git clone https://github.com/nickita-khylkouski/awake.git
-cd awake
-./install.sh
-awake start
-open ~/.local/bin/Awake.app
+npx --yes awake-agent install
 ```
+
+That one command installs the CLI, builds the native menu bar app into `~/.local/bin/Awake.app`, wires supported agent integrations, and opens the app.
+
+If you want the repo/development workflow instead, use the install steps below.
 
 If `awake install` warns about `pmset`, set up passwordless sudo:
 
@@ -217,16 +217,14 @@ open ~/.local/bin/Awake.app   # Open the menu bar app (optional)
 
 ### npm install
 
-If you want the CLI first and the app second:
+If you want a global install instead of `npx`:
 
 ```bash
 npm install -g awake-agent
 awake install
-awake start
-open ~/.local/bin/Awake.app
 ```
 
-`awake install` resolves its own package location, copies the helper files into `~/.local/bin`, builds the app bundle, and wires supported agent integrations.
+`awake install` resolves its own package location, copies the helper files into `~/.local/bin`, builds the app bundle, wires supported agent integrations, and opens the app automatically after a successful install.
 
 ### Optional: Auto-start on login
 
@@ -499,7 +497,6 @@ Install a fresh local build into `~/.local/bin`:
 
 ```bash
 ./awake install
-open ~/.local/bin/Awake.app
 ```
 
 ## Contributing
