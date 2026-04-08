@@ -2394,6 +2394,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         let s = cachedMenu  // Read from cache — no I/O, instant
 
+        menu.addItem(NSMenuItem(title: "Open Panel", action: #selector(showPanelAction), keyEquivalent: "p"))
+        menu.addItem(NSMenuItem.separator())
+
         // --- Status header ---
         let statusText = s.isNosleep ? "Nosleep \(s.uptimeStr)" : "Normal sleep"
         let headerItem = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
@@ -2471,7 +2474,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Open Panel", action: #selector(showPanelAction), keyEquivalent: "p"))
         menu.addItem(NSMenuItem(title: "Sleep Now", action: #selector(menuSleepNow), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q"))

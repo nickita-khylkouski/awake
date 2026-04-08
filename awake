@@ -42,11 +42,14 @@ LOCAL_APP_SRC_FILE="$LOCAL_APP_SRC_DIR/main.swift"
 REPO_APP_SRC_FILE="$SCRIPT_DIR/ui/main.swift"
 BASELINE_FILE="$HOME/.config/awake/power-baseline.json"
 PID_FILE="/tmp/awake.pid"
+DAEMON_LOCK_DIR="/tmp/awake-daemon.lock"
+DAEMON_OWNER_FILE="$DAEMON_LOCK_DIR/pid"
 STATE_FILE="/tmp/awake-state"
 LAST_ACTIVE_FILE="/tmp/awake-last-active"
 CAFFEINE_PID_FILE="/tmp/awake-caffeinate.pid"
 FOR_PID_FILE="/tmp/awake-for.pid"
 FOR_END_FILE="/tmp/awake-for-end"
+FOR_TOKEN_FILE="/tmp/awake-for-token"
 LOG_PREFIX="[awake]"
 
 # --- Helpers ---
@@ -54,6 +57,84 @@ LOG_PREFIX="[awake]"
 log() { echo "$LOG_PREFIX $(date '+%H:%M:%S') $*"; }
 
 now_epoch() { date +%s; }
+
+read_file_value() {
+    local path="$1"
+    [ -f "$path" ] || return 1
+    cat "$path" 2>/dev/null
+}
+
+pid_is_alive() {
+    local pid="${1:-}"
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+pid_matches_awake_daemon() {
+    local pid="${1:-}"
+    pid_is_alive "$pid" || return 1
+    local cmd
+    cmd="$(ps -p "$pid" -o command= 2>/dev/null)" || return 1
+    [[ "$cmd" == *"_daemon"* && "$cmd" == *"$(basename "$SCRIPT_PATH")"* ]]
+}
+
+active_daemon_pid() {
+    local pid
+    pid="$(read_file_value "$PID_FILE")" || return 1
+    pid_matches_awake_daemon "$pid" || return 1
+    echo "$pid"
+}
+
+timer_running() {
+    local pid
+    pid="$(read_file_value "$FOR_PID_FILE")" || return 1
+    pid_is_alive "$pid"
+}
+
+current_for_token() {
+    read_file_value "$FOR_TOKEN_FILE"
+}
+
+timer_claim_is_current() {
+    local token="$1"
+    local pid="$2"
+    [ "$(read_file_value "$FOR_PID_FILE" 2>/dev/null)" = "$pid" ] || return 1
+    [ "$(current_for_token 2>/dev/null)" = "$token" ]
+}
+
+daemon_lock_owned_by() {
+    local pid="$1"
+    [ -d "$DAEMON_LOCK_DIR" ] || return 1
+    [ "$(read_file_value "$DAEMON_OWNER_FILE" 2>/dev/null)" = "$pid" ]
+}
+
+daemon_owns_runtime() {
+    daemon_lock_owned_by "$$" || return 1
+    [ "$(read_file_value "$PID_FILE" 2>/dev/null)" = "$$" ]
+}
+
+acquire_daemon_lock() {
+    if mkdir "$DAEMON_LOCK_DIR" 2>/dev/null; then
+        echo "$$" > "$DAEMON_OWNER_FILE"
+        return 0
+    fi
+
+    local owner
+    owner="$(read_file_value "$DAEMON_OWNER_FILE" 2>/dev/null || true)"
+    if pid_matches_awake_daemon "$owner"; then
+        return 1
+    fi
+
+    rm -rf "$DAEMON_LOCK_DIR" 2>/dev/null || return 1
+    mkdir "$DAEMON_LOCK_DIR" 2>/dev/null || return 1
+    echo "$$" > "$DAEMON_OWNER_FILE"
+}
+
+release_daemon_lock() {
+    if daemon_lock_owned_by "$$"; then
+        rm -rf "$DAEMON_LOCK_DIR"
+    fi
+}
 
 python_temp_tool() {
     /usr/bin/python3 - "$@" <<'PY'
@@ -566,7 +647,7 @@ elif action == "ensure-baseline":
 elif action == "restore-baseline":
     baseline = load_baseline()
     if not baseline or not baseline.get("active"):
-        print("missing")
+        raise SystemExit(1)
     else:
         for source, values in baseline["sources"].items():
             if not values:
@@ -722,7 +803,7 @@ activate_yessleep() {
     # Kill any active for-timer so it doesn't fire later
     if [ -f "$FOR_PID_FILE" ]; then
         kill "$(cat "$FOR_PID_FILE")" 2>/dev/null || true
-        rm -f "$FOR_PID_FILE" "$FOR_END_FILE"
+        rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE"
     fi
     restore_normal_sleep_settings
 }
@@ -736,9 +817,14 @@ force_sleep() {
 
 cleanup() {
     trap - EXIT INT TERM
+    if ! daemon_owns_runtime; then
+        release_daemon_lock
+        return 0
+    fi
     log "Shutting down — restoring normal sleep"
     activate_yessleep
-    rm -f "$PID_FILE" "$STATE_FILE" "$LAST_ACTIVE_FILE" "$CAFFEINE_PID_FILE" "$FOR_END_FILE"
+    rm -f "$PID_FILE" "$STATE_FILE" "$LAST_ACTIVE_FILE" "$CAFFEINE_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE"
+    release_daemon_lock
 }
 
 parse_duration() {
@@ -851,12 +937,15 @@ cmd_setup() {
 
 cmd_daemon_start() {
     local background=false
+    local existing_pid
     [ "${1:-}" = "--bg" ] && background=true
 
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        log "Already running (PID $(cat "$PID_FILE")). Use: awake stop"
+    existing_pid="$(active_daemon_pid 2>/dev/null || true)"
+    if [ -n "$existing_pid" ]; then
+        log "Already running (PID $existing_pid). Use: awake stop"
         return 1
     fi
+    rm -f "$PID_FILE"
 
     if ! sudo -n pmset -g >/dev/null 2>&1; then
         log "ERROR: passwordless sudo for pmset not configured"
@@ -877,6 +966,10 @@ cmd_daemon_start() {
 
 cmd_daemon() {
     trap cleanup EXIT INT TERM
+    if ! acquire_daemon_lock; then
+        log "Another awake daemon is already running"
+        return 1
+    fi
     echo $$ > "$PID_FILE"
     log "Daemon started (PID $$, poll=${POLL_INTERVAL}s, grace=${GRACE_SECONDS}s)"
     log "Watching: $AGENTS"
@@ -905,8 +998,13 @@ cmd_daemon() {
             battery_warned=false  # reset when charging or no battery
         fi
 
-        # --- Agent detection ---
-        if agents_running; then
+        # --- Agent detection / manual timer override ---
+        if timer_running; then
+            grace_start=0
+            if [[ "$(current_state)" != nosleep* ]]; then
+                activate_nosleep
+            fi
+        elif agents_running; then
             echo "$(now_epoch)" > "$LAST_ACTIVE_FILE"
             grace_start=0
             activate_nosleep
@@ -937,28 +1035,36 @@ cmd_daemon() {
 }
 
 cmd_stop() {
+    local pid=""
     # Kill for-timer if running
     if [ -f "$FOR_PID_FILE" ]; then
         local for_pid=$(cat "$FOR_PID_FILE")
         kill "$for_pid" 2>/dev/null || true
-        rm -f "$FOR_PID_FILE" "$FOR_END_FILE"
+        rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE"
         log "Cancelled awake-for timer"
     fi
 
-    if [ ! -f "$PID_FILE" ]; then
-        log "Daemon not running"
-    else
-        local pid=$(cat "$PID_FILE")
-        if kill -0 "$pid" 2>/dev/null; then
-            log "Stopping daemon (PID $pid)..."
-            kill "$pid"
-            sleep 1
-            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
-            log "Stopped"
-        else
-            log "Stale pidfile (PID $pid not running)"
+    pid="$(active_daemon_pid 2>/dev/null || true)"
+    if [ -z "$pid" ]; then
+        if [ -f "$PID_FILE" ]; then
+            log "Stale pidfile (not an awake daemon)"
             rm -f "$PID_FILE"
+        else
+            log "Daemon not running"
         fi
+    else
+        log "Stopping daemon (PID $pid)..."
+        kill "$pid"
+        sleep 1
+        pid_is_alive "$pid" && kill -9 "$pid" 2>/dev/null
+        log "Stopped"
+    fi
+
+    local current_pid
+    current_pid="$(active_daemon_pid 2>/dev/null || true)"
+    if [ -n "$current_pid" ] && [ "$current_pid" != "$pid" ]; then
+        log "Another daemon is already running (PID $current_pid); skipping restore"
+        return 0
     fi
 
     activate_yessleep
@@ -967,14 +1073,16 @@ cmd_stop() {
 
 cmd_status() {
     local running=false
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    local daemon_pid=""
+    daemon_pid="$(active_daemon_pid 2>/dev/null || true)"
+    if [ -n "$daemon_pid" ]; then
         running=true
     fi
 
     local state=$(current_state)
     local agents=$(agent_summary)
 
-    echo "awake daemon: $($running && echo "running (PID $(cat "$PID_FILE"))" || echo "not running")"
+    echo "awake daemon: $($running && echo "running (PID $daemon_pid)" || echo "not running")"
     echo "power state:  $state"
     echo "agents:       $agents"
     echo "watching:     $AGENTS"
@@ -1000,7 +1108,7 @@ cmd_status() {
     fi
 
     # For timer
-    if [ -f "$FOR_PID_FILE" ] && kill -0 "$(cat "$FOR_PID_FILE")" 2>/dev/null; then
+    if timer_running; then
         echo "for timer:    active"
     fi
 
@@ -1038,32 +1146,44 @@ cmd_for() {
     # Kill previous for-timer
     if [ -f "$FOR_PID_FILE" ]; then
         kill "$(cat "$FOR_PID_FILE")" 2>/dev/null || true
-        rm -f "$FOR_PID_FILE" "$FOR_END_FILE"
+        rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE"
     fi
 
     activate_nosleep
     local mins=$(( secs / 60 ))
     local end_epoch=$(( $(now_epoch) + secs ))
+    local token
+    token="$(now_epoch)-$$-$RANDOM"
     log "Nosleep for ${mins}m, then restoring Sleep OK"
     notify "awake" "Staying awake for ${mins} minutes, then restoring Sleep OK."
 
     # Write end time so UI can show countdown
     echo "$end_epoch" > "$FOR_END_FILE"
+    echo "$token" > "$FOR_TOKEN_FILE"
 
     # Background timer
     (
+        local timer_pid="$BASHPID"
+        local waiting_for_agents=false
         sleep "$secs"
-        # Check if agents are still running — skip force-sleep if so
-        if agents_running; then
-            log "Timer expired but agents still running — staying awake"
-            notify "awake" "Timer expired but agents active. Staying awake."
-            rm -f "$FOR_PID_FILE" "$FOR_END_FILE"
+        while timer_claim_is_current "$token" "$timer_pid"; do
+            if agents_running; then
+                if [ "$waiting_for_agents" = false ]; then
+                    log "Timer expired but agents still running — waiting to restore Sleep OK"
+                    notify "awake" "Timer expired, waiting for agents to stop before restoring Sleep OK."
+                    waiting_for_agents=true
+                fi
+                sleep "$POLL_INTERVAL"
+                continue
+            fi
+            log "Timer expired — restoring Sleep OK"
+            notify "awake" "Timer expired. Sleep OK restored."
+            restore_normal_sleep_settings
+            if timer_claim_is_current "$token" "$timer_pid"; then
+                rm -f "$FOR_PID_FILE" "$FOR_END_FILE" "$FOR_TOKEN_FILE"
+            fi
             exit 0
-        fi
-        log "Timer expired — restoring Sleep OK"
-        notify "awake" "Timer expired. Sleep OK restored."
-        restore_normal_sleep_settings
-        rm -f "$FOR_PID_FILE" "$FOR_END_FILE"
+        done
     ) &
     echo $! > "$FOR_PID_FILE"
     disown
@@ -1086,12 +1206,18 @@ cmd_run_command() {
     log "Running: $*"
 
     local exit_code=0
+    local daemon_active=false
     "$@" || exit_code=$?
 
-    activate_yessleep
-    log "Command finished (exit $exit_code)"
-    # Only clean up state if daemon is NOT running (it manages its own state)
-    if ! [ -f "$PID_FILE" ] || ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    if active_daemon_pid >/dev/null 2>&1; then
+        daemon_active=true
+    fi
+
+    if timer_running || $daemon_active; then
+        log "Command finished (exit $exit_code) — leaving restore to active awake session"
+    else
+        activate_yessleep
+        log "Command finished (exit $exit_code)"
         rm -f "$CAFFEINE_PID_FILE" "$STATE_FILE"
     fi
     return $exit_code

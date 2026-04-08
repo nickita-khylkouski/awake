@@ -9,6 +9,7 @@ STATE_ROOT="$TEST_ROOT/state"
 PMSET_STATE_DIR="$TEST_ROOT/pmset"
 PMSET_LOG="$TEST_ROOT/pmset.log"
 TEST_HOME="$TEST_ROOT/home"
+AGENTS_STATE_FILE="$TEST_ROOT/agents-active"
 mkdir -p "$STUB_BIN" "$STATE_ROOT" "$PMSET_STATE_DIR" "$TEST_HOME/.config/awake"
 
 cleanup() {
@@ -35,7 +36,8 @@ EOF
 cat > "$STUB_BIN/pgrep" <<'EOF'
 #!/bin/bash
 set -euo pipefail
-if [ "${AWAKE_TEST_AGENTS_ACTIVE:-0}" = "1" ]; then
+state_file="${AWAKE_TEST_AGENTS_FILE:?}"
+if [ "$(cat "$state_file" 2>/dev/null || echo 0)" = "1" ]; then
     echo 4242
     exit 0
 fi
@@ -150,6 +152,7 @@ export HOME="$TEST_HOME"
 export PATH="$STUB_BIN:/usr/bin:/bin:/usr/sbin:/sbin"
 export AWAKE_TEST_PMSET_LOG="$PMSET_LOG"
 export AWAKE_TEST_PMSET_STATE_DIR="$PMSET_STATE_DIR"
+export AWAKE_TEST_AGENTS_FILE="$AGENTS_STATE_FILE"
 
 AWAKE_LIB="$TEST_ROOT/awake-lib.sh"
 sed '/^# --- Main ---/,$d' "$REPO_DIR/awake" > "$AWAKE_LIB"
@@ -166,6 +169,10 @@ log() {
 
 notify() {
     :
+}
+
+set_agents_active() {
+    echo "${1:-0}" > "$AGENTS_STATE_FILE"
 }
 
 seed_pmset_state() {
@@ -199,8 +206,12 @@ setup_state() {
     CAFFEINE_PID_FILE="$dir/awake-caffeinate.pid"
     FOR_PID_FILE="$dir/awake-for.pid"
     FOR_END_FILE="$dir/awake-for-end"
+    FOR_TOKEN_FILE="$dir/awake-for-token"
     BASELINE_FILE="$dir/power-baseline.json"
+    DAEMON_LOCK_DIR="$dir/daemon-lock"
+    DAEMON_OWNER_FILE="$DAEMON_LOCK_DIR/pid"
     : > "$PMSET_LOG"
+    set_agents_active 0
     rm -f /tmp/awake-claude-* /tmp/awake-codex-* 2>/dev/null || true
     seed_pmset_state
 }
@@ -257,7 +268,7 @@ wait_for_timer_exit() {
 
 test_timer_restores_sleep_ok() {
     setup_state restore
-    export AWAKE_TEST_AGENTS_ACTIVE=0
+    set_agents_active 0
     cmd_for 1 >/dev/null
     wait_for_timer_exit
     assert_equals "normal" "$(cat "$STATE_FILE")"
@@ -271,19 +282,23 @@ test_timer_restores_sleep_ok() {
 
 test_timer_stays_awake_when_agents_active() {
     setup_state active-agents
-    export AWAKE_TEST_AGENTS_ACTIVE=1
+    set_agents_active 1
+    POLL_INTERVAL=1
     cmd_for 1 >/dev/null
-    wait_for_timer_exit
+    sleep 1.2
     assert_equals "nosleep-full" "$(cat "$STATE_FILE")"
     assert_equals "0" "$(pmset_value battery sleep)"
     assert_equals "0" "$(pmset_value battery displaysleep)"
+    [ -f "$FOR_PID_FILE" ]
+    [ -f "$FOR_TOKEN_FILE" ]
     [ -f "$BASELINE_FILE" ]
     assert_not_contains "pmset sleepnow" "$PMSET_LOG"
+    activate_yessleep
 }
 
 test_manual_yessleep_cancels_timer() {
     setup_state manual-cancel
-    export AWAKE_TEST_AGENTS_ACTIVE=0
+    set_agents_active 0
     cmd_for 1 >/dev/null
     sleep 0.2
     activate_yessleep
@@ -292,7 +307,36 @@ test_manual_yessleep_cancels_timer() {
     assert_equals "10" "$(pmset_value battery sleep)"
     [ ! -f "$FOR_PID_FILE" ]
     [ ! -f "$FOR_END_FILE" ]
+    [ ! -f "$FOR_TOKEN_FILE" ]
     assert_not_contains "pmset sleepnow" "$PMSET_LOG"
+}
+
+test_timer_waits_until_agents_stop_before_restoring() {
+    setup_state wait-for-agents
+    set_agents_active 1
+    POLL_INTERVAL=1
+    cmd_for 1 >/dev/null
+    sleep 1.2
+    [ -f "$FOR_PID_FILE" ]
+    [ -f "$FOR_TOKEN_FILE" ]
+    assert_equals "nosleep-full" "$(cat "$STATE_FILE")"
+
+    set_agents_active 0
+    wait_for_timer_exit
+    assert_equals "normal" "$(cat "$STATE_FILE")"
+    assert_equals "10" "$(pmset_value battery sleep)"
+    [ ! -f "$FOR_PID_FILE" ]
+    [ ! -f "$FOR_END_FILE" ]
+    [ ! -f "$FOR_TOKEN_FILE" ]
+}
+
+test_restore_without_baseline_falls_back() {
+    setup_state restore-without-baseline
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+    echo "nosleep-full" > "$STATE_FILE"
+    restore_normal_sleep_settings
+    assert_equals "normal" "$(cat "$STATE_FILE")"
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
 }
 
 test_settings_apply_inactive() {
@@ -338,6 +382,8 @@ test_temp_json() {
 test_timer_restores_sleep_ok
 test_timer_stays_awake_when_agents_active
 test_manual_yessleep_cancels_timer
+test_timer_waits_until_agents_stop_before_restoring
+test_restore_without_baseline_falls_back
 test_settings_apply_inactive
 test_settings_apply_active_updates_baseline
 test_settings_dump_json
