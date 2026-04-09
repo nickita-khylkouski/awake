@@ -51,7 +51,14 @@ npx --yes awake-agent install
 
 That one command installs the CLI, builds the native menu bar app into `~/.local/bin/Awake.app`, wires supported agent integrations, and opens the app.
 
-If you want the repo/development workflow instead, use the install steps below.
+If you want a persistent global install instead of `npx`, use:
+
+```bash
+npm install -g awake-agent
+awake install
+```
+
+If you want the repo/development workflow instead, use the install section below.
 
 ## Updating
 
@@ -193,33 +200,62 @@ Before installing, you need:
 
 ## Install
 
-`awake` supports two install paths:
+All install methods end up with the same local app bundle at `~/.local/bin/Awake.app`.
 
-- Source install: best if you want the repo locally
-- npm install: best if you want the CLI to bootstrap the app for you
+### Option 1: `npx` install
 
-Both produce the same native app bundle at `~/.local/bin/Awake.app`.
+Best for a fast install without keeping a global npm package around.
 
-### Step 1: Clone the repo
+```bash
+npx --yes awake-agent install
+```
+
+Use this again later to update:
+
+```bash
+npx --yes awake-agent@latest install
+```
+
+### Option 2: global npm install
+
+Best if you want `awake` on your PATH as a normal command.
+
+```bash
+npm install -g awake-agent
+awake install
+```
+
+Use this later to update:
+
+```bash
+npm install -g awake-agent@latest
+awake install
+```
+
+### Option 3: repo/source install
+
+Best if you want the repo locally and expect to edit the project.
 
 ```bash
 git clone https://github.com/nickita-khylkouski/awake.git
 cd awake
-```
-
-### Step 2: Run the installer
-
-```bash
 ./install.sh
 ```
 
-This does:
+This install path:
 - Copies `awake`, `awake-build-ui`, `awake-hook`, and `awake-notify` into `~/.local/bin`
 - Creates `~/.config/awake/config` with default settings
 - Builds the menu bar app
-- Patches Claude Code `~/.claude/settings.json` to add heartbeat hooks (if Claude Code is installed)
-- Patches Codex `~/.codex/config.toml` notification hook (if Codex is installed)
-- Warns if sudoers isn't set up
+- Patches Claude Code `~/.claude/settings.json` to add heartbeat hooks if Claude Code is installed
+- Patches Codex `~/.codex/config.toml` notification hook if Codex is installed
+- Warns if sudoers is not set up
+
+Repo installs update with:
+
+```bash
+git pull
+awake install
+```
 
 Make sure `~/.local/bin` is on your PATH. Add to your `~/.zshrc` if needed:
 ```bash
@@ -247,16 +283,7 @@ awake start              # Start the daemon
 open ~/.local/bin/Awake.app   # Open the menu bar app (optional)
 ```
 
-### npm install
-
-If you want a global install instead of `npx`:
-
-```bash
-npm install -g awake-agent
-awake install
-```
-
-`awake install` resolves its own package location, copies the helper files into `~/.local/bin`, builds the app bundle, wires supported agent integrations, and opens the app automatically after a successful install.
+No matter which install path you used, `awake install` resolves its own package or repo location, copies the helper files into `~/.local/bin`, builds the app bundle, wires supported agent integrations, and opens the app automatically after a successful install.
 
 ### Optional: Auto-start on login
 
