@@ -1937,7 +1937,7 @@ cmd_daemon() {
 
     while true; do
         # --- Battery guard (always, regardless of agent source) ---
-        if [ "$(lease_count)" -gt 0 ] && enforce_battery_guard; then
+        if enforce_battery_guard; then
             grace_start=0
             sleep "$POLL_INTERVAL"
             continue

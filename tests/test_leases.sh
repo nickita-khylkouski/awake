@@ -151,6 +151,7 @@ setup_state() {
     BASELINE_FILE="$dir/power-baseline.json"
     MODE_FILE="$dir/default-mode"
     WHY_FILE="$dir/awake-why"
+    BATTERY_GUARD_FILE="$dir/awake-battery-guard"
     DAEMON_LOCK_DIR="$dir/daemon-lock"
     DAEMON_OWNER_FILE="$DAEMON_LOCK_DIR/pid"
     mkdir -p "$LEASES_DIR" "$RULES_DIR"
@@ -163,6 +164,7 @@ setup_state() {
     echo 10 > "$PMSET_STATE_DIR/ac.sleep"
     echo 5 > "$PMSET_STATE_DIR/battery.displaysleep"
     echo 5 > "$PMSET_STATE_DIR/ac.displaysleep"
+    rm -f "$BATTERY_GUARD_FILE"
 }
 
 set_on_battery() {
@@ -181,6 +183,22 @@ assert_equals() {
         exit 1
     fi
 }
+
+setup_state
+
+set_on_battery
+echo 4 > "$PMSET_STATE_DIR/battery-pct"
+enforce_battery_guard
+grep -q "pmset sleepnow" "$PMSET_LOG"
+
+setup_state
+set_charging
+echo 4 > "$PMSET_STATE_DIR/battery-pct"
+if enforce_battery_guard; then
+    echo "battery guard should not trigger while charging" >&2
+    exit 1
+fi
+[ ! -s "$PMSET_LOG" ]
 
 setup_state
 
