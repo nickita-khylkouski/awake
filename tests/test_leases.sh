@@ -189,6 +189,7 @@ setup_state
 set_on_battery
 echo 4 > "$PMSET_STATE_DIR/battery-pct"
 enforce_battery_guard
+grep -q "pmset displaysleepnow" "$PMSET_LOG"
 grep -q "pmset sleepnow" "$PMSET_LOG"
 
 setup_state
@@ -243,6 +244,7 @@ lease_create_or_update "manual-toggle" "manual" "presenting" "Manual lease" 100 
 reconcile_effective_state
 [ ! -d "$LEASES_DIR/manual-toggle" ]
 assert_equals "normal" "$(cat "$STATE_FILE")"
+grep -q "pmset displaysleepnow" "$PMSET_LOG"
 grep -q "pmset sleepnow" "$PMSET_LOG"
 
 setup_state

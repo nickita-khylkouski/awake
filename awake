@@ -1729,8 +1729,17 @@ force_sleep() {
         rm -rf "$dir"
     done
     restore_normal_sleep_settings
-    sleep 2
-    sudo -n pmset sleepnow 2>/dev/null || true
+    # Drop display power immediately, then keep asking macOS to sleep.
+    # This is the emergency path for critical battery and should win even
+    # if Awake was previously holding strong no-sleep assertions.
+    sudo -n pmset displaysleepnow 2>/dev/null || true
+    local attempt
+    for attempt in 1 2 3; do
+        sudo -n pmset sleepnow 2>/dev/null && return 0
+        sleep 1
+    done
+    log "ERROR: Failed to force sleep via pmset sleepnow"
+    return 1
 }
 
 cleanup() {
