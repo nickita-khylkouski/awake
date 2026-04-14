@@ -8,6 +8,7 @@ STUB_BIN="$TEST_ROOT/bin"
 STATE_ROOT="$TEST_ROOT/state"
 PMSET_STATE_DIR="$TEST_ROOT/pmset"
 PMSET_LOG="$TEST_ROOT/pmset.log"
+OSASCRIPT_LOG="$TEST_ROOT/osascript.log"
 TEST_HOME="$TEST_ROOT/home"
 mkdir -p "$STUB_BIN" "$STATE_ROOT" "$PMSET_STATE_DIR" "$TEST_HOME/.config/awake"
 
@@ -43,6 +44,12 @@ EOF
 
 cat > "$STUB_BIN/osascript" <<'EOF'
 #!/bin/bash
+set -euo pipefail
+printf 'osascript %s\n' "$*" >> "${AWAKE_TEST_OSASCRIPT_LOG:?}"
+if [ -f "${AWAKE_TEST_PMSET_STATE_DIR:?}/fail-osascript-sleep" ]; then
+    exit 1
+fi
+echo 1 > "${AWAKE_TEST_PMSET_STATE_DIR:?}/osascript-slept"
 exit 0
 EOF
 
@@ -94,6 +101,22 @@ if [ "${1:-}" = "-g" ]; then
     exit 0
 fi
 
+if [ "${1:-}" = "displaysleepnow" ]; then
+    echo 1 > "$state_dir/display-slept"
+    if [ -f "$state_dir/fail-displaysleepnow" ]; then
+        exit 1
+    fi
+    exit 0
+fi
+
+if [ "${1:-}" = "sleepnow" ]; then
+    if [ -f "$state_dir/fail-sleepnow" ]; then
+        exit 1
+    fi
+    echo 1 > "$state_dir/pmset-slept"
+    exit 0
+fi
+
 scope="${1:-}"
 shift || true
 while [ "$#" -gt 0 ]; do
@@ -125,6 +148,7 @@ export HOME="$TEST_HOME"
 export PATH="$STUB_BIN:/usr/bin:/bin:/usr/sbin:/sbin"
 export AWAKE_TEST_PMSET_LOG="$PMSET_LOG"
 export AWAKE_TEST_PMSET_STATE_DIR="$PMSET_STATE_DIR"
+export AWAKE_TEST_OSASCRIPT_LOG="$OSASCRIPT_LOG"
 
 AWAKE_LIB="$TEST_ROOT/awake-lib.sh"
 sed '/^# --- Main ---/,$d' "$REPO_DIR/awake" > "$AWAKE_LIB"
@@ -157,6 +181,7 @@ setup_state() {
     mkdir -p "$LEASES_DIR" "$RULES_DIR"
     echo "agent-safe" > "$MODE_FILE"
     : > "$PMSET_LOG"
+    : > "$OSASCRIPT_LOG"
     echo 0 > "$PMSET_STATE_DIR/disablesleep"
     echo 50 > "$PMSET_STATE_DIR/battery-pct"
     rm -f "$PMSET_STATE_DIR/on-battery"
@@ -164,6 +189,8 @@ setup_state() {
     echo 10 > "$PMSET_STATE_DIR/ac.sleep"
     echo 5 > "$PMSET_STATE_DIR/battery.displaysleep"
     echo 5 > "$PMSET_STATE_DIR/ac.displaysleep"
+    rm -f "$PMSET_STATE_DIR/pmset-slept" "$PMSET_STATE_DIR/osascript-slept" "$PMSET_STATE_DIR/display-slept"
+    rm -f "$PMSET_STATE_DIR/fail-sleepnow" "$PMSET_STATE_DIR/fail-displaysleepnow" "$PMSET_STATE_DIR/fail-osascript-sleep"
     rm -f "$BATTERY_GUARD_FILE"
 }
 
@@ -191,6 +218,17 @@ echo 4 > "$PMSET_STATE_DIR/battery-pct"
 enforce_battery_guard
 grep -q "pmset displaysleepnow" "$PMSET_LOG"
 grep -q "pmset sleepnow" "$PMSET_LOG"
+[ -f "$PMSET_STATE_DIR/pmset-slept" ]
+
+setup_state
+set_on_battery
+touch "$PMSET_STATE_DIR/fail-sleepnow"
+echo 4 > "$PMSET_STATE_DIR/battery-pct"
+enforce_battery_guard
+grep -q "pmset displaysleepnow" "$PMSET_LOG"
+grep -q "pmset sleepnow" "$PMSET_LOG"
+grep -q 'System Events" to sleep' "$OSASCRIPT_LOG"
+[ -f "$PMSET_STATE_DIR/osascript-slept" ]
 
 setup_state
 set_charging
@@ -246,6 +284,16 @@ reconcile_effective_state
 assert_equals "normal" "$(cat "$STATE_FILE")"
 grep -q "pmset displaysleepnow" "$PMSET_LOG"
 grep -q "pmset sleepnow" "$PMSET_LOG"
+
+setup_state
+set_on_battery
+touch "$PMSET_STATE_DIR/fail-sleepnow"
+echo 4 > "$PMSET_STATE_DIR/battery-pct"
+lease_create_or_update "manual-toggle" "manual" "presenting" "Manual lease" 100 "" "test"
+reconcile_effective_state
+[ ! -d "$LEASES_DIR/manual-toggle" ]
+assert_equals "normal" "$(cat "$STATE_FILE")"
+grep -q 'System Events" to sleep' "$OSASCRIPT_LOG"
 
 setup_state
 set_charging

@@ -1738,6 +1738,10 @@ force_sleep() {
         sudo -n pmset sleepnow 2>/dev/null && return 0
         sleep 1
     done
+    # Some setups ignore or reject pmset sleepnow even after Awake drops its
+    # own assertions. Fall back to a direct Apple event so the machine still
+    # attempts to sleep on critical battery.
+    osascript -e 'tell application "System Events" to sleep' >/dev/null 2>&1 && return 0
     log "ERROR: Failed to force sleep via pmset sleepnow"
     return 1
 }
