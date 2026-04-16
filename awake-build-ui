@@ -7,6 +7,7 @@ set -euo pipefail
 
 SRC_DIR="$HOME/.local/bin/AwakeApp"
 SRC_FILE="$SRC_DIR/main.swift"
+PRIVATE_HEADER_FILE="$SRC_DIR/private-apis.h"
 BINARY="$SRC_DIR/AwakeUI"
 BUILD_HASH_FILE="$SRC_DIR/main.swift.sha256"
 APP_DIR="$HOME/.local/bin/Awake.app/Contents"
@@ -14,6 +15,10 @@ APP_ROOT="$HOME/.local/bin/Awake.app"
 RESOURCE_BIN_DIR="$APP_DIR/Resources/bin"
 SCRIPT_SOURCE_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 REPO_SRC_FILE="$SCRIPT_SOURCE_DIR/ui/main.swift"
+REPO_PRIVATE_HEADER="$SCRIPT_SOURCE_DIR/ui/private-apis.h"
+BUNDLED_UI_SOURCE_DIR="$SCRIPT_SOURCE_DIR/../ui"
+BUNDLED_SRC_FILE="$BUNDLED_UI_SOURCE_DIR/main.swift"
+BUNDLED_PRIVATE_HEADER="$BUNDLED_UI_SOURCE_DIR/private-apis.h"
 PACKAGE_JSON_SOURCE="$SCRIPT_SOURCE_DIR/package.json"
 PACKAGE_JSON_BUNDLED="$SCRIPT_SOURCE_DIR/awake-package.json"
 LOCAL_PACKAGE_JSON="$HOME/.local/bin/awake-package.json"
@@ -53,6 +58,11 @@ PACKAGE_VERSION="$(resolve_package_version "$PACKAGE_JSON_BUNDLED" "$PACKAGE_JSO
 if [ -f "$REPO_SRC_FILE" ]; then
     mkdir -p "$SRC_DIR"
     cp "$REPO_SRC_FILE" "$SRC_FILE"
+    [ -f "$REPO_PRIVATE_HEADER" ] && cp "$REPO_PRIVATE_HEADER" "$PRIVATE_HEADER_FILE"
+elif [ -f "$BUNDLED_SRC_FILE" ]; then
+    mkdir -p "$SRC_DIR"
+    cp "$BUNDLED_SRC_FILE" "$SRC_FILE"
+    [ -f "$BUNDLED_PRIVATE_HEADER" ] && cp "$BUNDLED_PRIVATE_HEADER" "$PRIVATE_HEADER_FILE"
 fi
 
 # --- 2. Check source exists ---
@@ -64,7 +74,12 @@ fi
 
 # --- 3. Decide whether a rebuild is needed ---
 
-SOURCE_HASH="$(shasum -a 256 "$SRC_FILE" | awk '{print $1}')"
+SOURCE_HASH="$(
+    {
+        shasum -a 256 "$SRC_FILE"
+        [ -f "$PRIVATE_HEADER_FILE" ] && shasum -a 256 "$PRIVATE_HEADER_FILE"
+    } | shasum -a 256 | awk '{print $1}'
+)"
 PREV_HASH=""
 [ -f "$BUILD_HASH_FILE" ] && PREV_HASH="$(cat "$BUILD_HASH_FILE" 2>/dev/null || true)"
 NEEDS_COMPILE=true
@@ -76,7 +91,11 @@ fi
 
 if $NEEDS_COMPILE; then
     log "Compiling $SRC_FILE... (first build can take ~20-40s)"
-    swiftc -framework AppKit -framework SwiftUI -framework UserNotifications -framework IOKit -o "$BINARY" "$SRC_FILE"
+    SWIFTC_ARGS=(-framework AppKit -framework SwiftUI -framework UserNotifications -framework IOKit)
+    if [ -f "$PRIVATE_HEADER_FILE" ]; then
+        SWIFTC_ARGS+=(-import-objc-header "$PRIVATE_HEADER_FILE" -F /System/Library/PrivateFrameworks -framework CoreGraphics -framework CoreBrightness -framework CoreDisplay -framework DisplayServices)
+    fi
+    swiftc "${SWIFTC_ARGS[@]}" -o "$BINARY" "$SRC_FILE"
     printf '%s\n' "$SOURCE_HASH" > "$BUILD_HASH_FILE"
     log "Compiled: $(ls -lh "$BINARY" | awk '{print $5}') arm64 binary"
 else
@@ -94,6 +113,7 @@ log "Installed binary to $APP_DIR/MacOS/AwakeUI"
 
 # Keep the bundle self-contained so it can reinstall/rebuild itself later.
 cp "$SRC_FILE" "$BUNDLED_UI_DIR/main.swift"
+[ -f "$PRIVATE_HEADER_FILE" ] && cp "$PRIVATE_HEADER_FILE" "$BUNDLED_UI_DIR/private-apis.h"
 
 # Copy bundled helper scripts so the .app is self-contained
 for tool in awake awake-hook awake-notify awake-build-ui awake-build-icon; do

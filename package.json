@@ -19,7 +19,8 @@
     "awake-hook",
     "awake-notify",
     "install.sh",
-    "ui/main.swift"
+    "ui/main.swift",
+    "ui/private-apis.h"
   ],
   "scripts": {
     "verify:shell": "bash -n awake && bash -n awake-build-ui && bash -n awake-hook && bash -n awake-notify && bash -n install.sh"

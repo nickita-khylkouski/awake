@@ -21,6 +21,7 @@ Unlike generic keep-awake tools, `awake` is built around long-running AI coding 
 - Agent-aware daemon with process and hook-based detection
 - Lid-close prevention via `pmset disablesleep 1`
 - Native macOS menu bar app with panel, graph, logs, and setup flow
+- Multi-display blackout overlay with a global toggle hotkey
 - Manual sessions, timers, and `awake run <cmd>` command-scoped protection
 - Battery protection and automatic restore behavior
 - Hook wiring for Claude Code and Codex
@@ -119,6 +120,7 @@ When you run AI coding agents (Claude Code, Codex CLI, Aider, etc.) on a laptop,
 
 - Left-click toggles Awake on or off
 - Right-click opens the full panel
+- `Option+1` blacks out every connected display, hides the cursor, blocks local input, and turns off the MacBook keyboard backlight while the Mac keeps running
 - Panel includes hero state, timers, daemon controls, logs, rules, and setup guidance
 - Settings and power controls are available directly in the app
 
@@ -362,6 +364,7 @@ Interactions:
 - Left-click toggles Awake on or off
 - Right-click opens the main panel
 - `Ctrl+Shift+A` opens the panel directly
+- `Option+1` toggles a full-screen blackout across every connected display, hides the cursor, blocks local input, and drops the MacBook keyboard backlight to zero until you toggle it again
 
 The panel includes:
 - Hero state with the current effective wake mode
@@ -492,8 +495,8 @@ If it shows 0, something is resetting it. Check if another tool (Amphetamine, et
 ### Menu bar icon doesn't appear
 On MacBooks with a notch, the menu bar has limited space. If too many icons are present, macOS silently hides new ones. Try:
 - Quit other menu bar apps to free space
-- If your menu bar is crowded, use Awake's Dock icon, hotkey, or menu bar control permissions to keep it easy to reopen
-- The panel still works via `Ctrl+Shift+A` even without the icon
+- If your menu bar is crowded, use Awake's Dock icon, hotkeys, or menu bar control permissions to keep it easy to reopen
+- The panel still works via `Ctrl+Shift+A` even without the icon, and `Option+1` still toggles blackout
 
 ### Orphaned caffeinate processes
 If you see multiple `caffeinate` processes:

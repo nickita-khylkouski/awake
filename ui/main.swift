@@ -39,6 +39,9 @@ let CPU_TEMP_SAMPLE_INTERVAL: TimeInterval = 60
 let ONBOARDING_STATE_PATH = NSString("~/.config/awake/onboarding-completed.json").expandingTildeInPath
 let ONBOARDING_VERSION = 2
 let AWAKE_REPO_URL = "https://github.com/nickita-khylkouski/awake"
+let PANEL_HOTKEY_LABEL = "Ctrl+Shift+A"
+let BLACKOUT_HOTKEY_LABEL = "Option+1"
+let DDC_BRIGHTNESS_COMMAND: UInt8 = 0x10
 
 let AGENTS: [String] = {
     if let env = ProcessInfo.processInfo.environment["AWAKE_AGENTS"] {
@@ -54,6 +57,10 @@ private let timeFormatter: DateFormatter = {
 }()
 
 private let batteryRegex = try! NSRegularExpression(pattern: #"(\d+)%"#)
+
+extension Notification.Name {
+    static let awakeBlackoutStateDidChange = Notification.Name("awake.blackoutStateDidChange")
+}
 
 // MARK: - Helpers
 
@@ -123,6 +130,10 @@ func appleScriptStringLiteral(_ value: String) -> String {
         .replacingOccurrences(of: "\\", with: "\\\\")
         .replacingOccurrences(of: "\"", with: "\\\"")
     return "\"\(escaped)\""
+}
+
+func fourCharCode(_ string: String) -> OSType {
+    string.utf8.reduce(0) { ($0 << 8) | OSType($1) }
 }
 
 func hasMenuBarControlAccess() -> Bool {
@@ -208,6 +219,814 @@ struct UpdateSnapshot: Decodable {
     let error: String?
     let releaseURL: String
     let source: String
+}
+
+final class GlobalHotKeyController {
+    typealias HotKeyAction = () -> Void
+
+    private var registeredRefs: [UInt32: EventHotKeyRef] = [:]
+    private var actions: [UInt32: HotKeyAction] = [:]
+    private var eventHandlerRef: EventHandlerRef?
+
+    init() {
+        var eventSpec = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+        InstallEventHandler(
+            GetApplicationEventTarget(),
+            { _, event, userData in
+                guard let event, let userData else { return noErr }
+                let controller = Unmanaged<GlobalHotKeyController>.fromOpaque(userData).takeUnretainedValue()
+                return controller.handle(event: event)
+            },
+            1,
+            &eventSpec,
+            Unmanaged.passUnretained(self).toOpaque(),
+            &eventHandlerRef
+        )
+    }
+
+    deinit {
+        for ref in registeredRefs.values {
+            UnregisterEventHotKey(ref)
+        }
+        if let eventHandlerRef {
+            RemoveEventHandler(eventHandlerRef)
+        }
+    }
+
+    @discardableResult
+    func register(id: UInt32, keyCode: UInt32, modifiers: UInt32, action: @escaping HotKeyAction) -> Bool {
+        if let existing = registeredRefs[id] {
+            UnregisterEventHotKey(existing)
+            registeredRefs.removeValue(forKey: id)
+        }
+
+        var hotKeyRef: EventHotKeyRef?
+        let hotKeyID = EventHotKeyID(signature: fourCharCode("AWAK"), id: id)
+        let status = RegisterEventHotKey(
+            keyCode,
+            modifiers,
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &hotKeyRef
+        )
+
+        guard status == noErr, let hotKeyRef else { return false }
+        registeredRefs[id] = hotKeyRef
+        actions[id] = action
+        return true
+    }
+
+    private func handle(event: EventRef) -> OSStatus {
+        var hotKeyID = EventHotKeyID()
+        let status = GetEventParameter(
+            event,
+            EventParamName(kEventParamDirectObject),
+            EventParamType(typeEventHotKeyID),
+            nil,
+            MemoryLayout<EventHotKeyID>.size,
+            nil,
+            &hotKeyID
+        )
+        guard status == noErr, let action = actions[hotKeyID.id] else {
+            return status
+        }
+        DispatchQueue.main.async(execute: action)
+        return noErr
+    }
+}
+
+final class Arm64DDC: NSObject {
+    struct IOregService {
+        var edidUUID = ""
+        var productName = ""
+        var serialNumber: Int64 = 0
+        var location = ""
+        var ioDisplayLocation = ""
+        var service: IOAVService?
+        var serviceLocation = 0
+    }
+
+    struct Arm64Service {
+        var displayID: CGDirectDisplayID = 0
+        var service: IOAVService?
+        var serviceLocation = 0
+        var dummy = false
+        var serviceDetails: IOregService
+        var matchScore = 0
+    }
+
+    static let maxMatchScore = 20
+    static let ddcAddress: UInt8 = 0x37
+    static let ddcDataAddress: UInt8 = 0x51
+
+    static func getServiceMatches(displayIDs: [CGDirectDisplayID]) -> [Arm64Service] {
+        let candidates = getIoregServicesForMatching()
+        var scored: [Int: [Arm64Service]] = [:]
+
+        for displayID in displayIDs {
+            for candidate in candidates {
+                let service = Arm64Service(
+                    displayID: displayID,
+                    service: candidate.service,
+                    serviceLocation: candidate.serviceLocation,
+                    dummy: checkIfDummy(ioregService: candidate),
+                    serviceDetails: candidate,
+                    matchScore: ioregMatchScore(
+                        displayID: displayID,
+                        ioregEdidUUID: candidate.edidUUID,
+                        ioDisplayLocation: candidate.ioDisplayLocation,
+                        ioregProductName: candidate.productName,
+                        ioregSerialNumber: candidate.serialNumber
+                    )
+                )
+                scored[service.matchScore, default: []].append(service)
+            }
+        }
+
+        var takenServiceLocations: Set<Int> = []
+        var takenDisplayIDs: Set<CGDirectDisplayID> = []
+        var matches: [Arm64Service] = []
+
+        for score in stride(from: maxMatchScore, to: 0, by: -1) {
+            for candidate in scored[score] ?? [] {
+                guard !takenDisplayIDs.contains(candidate.displayID) else { continue }
+                guard !takenServiceLocations.contains(candidate.serviceLocation) else { continue }
+                takenDisplayIDs.insert(candidate.displayID)
+                takenServiceLocations.insert(candidate.serviceLocation)
+                matches.append(candidate)
+            }
+        }
+
+        return matches
+    }
+
+    static func read(service: IOAVService?, command: UInt8) -> (current: UInt16, max: UInt16)? {
+        var send: [UInt8] = [command]
+        var reply = [UInt8](repeating: 0, count: 11)
+        guard performDDCCommunication(service: service, send: &send, reply: &reply) else {
+            return nil
+        }
+        let max = UInt16(reply[6]) * 256 + UInt16(reply[7])
+        let current = UInt16(reply[8]) * 256 + UInt16(reply[9])
+        return (current, max)
+    }
+
+    static func write(service: IOAVService?, command: UInt8, value: UInt16) -> Bool {
+        var send: [UInt8] = [command, UInt8(value >> 8), UInt8(value & 0xFF)]
+        var reply: [UInt8] = []
+        return performDDCCommunication(service: service, send: &send, reply: &reply)
+    }
+
+    private static func performDDCCommunication(service: IOAVService?, send: inout [UInt8], reply: inout [UInt8]) -> Bool {
+        guard let service else { return false }
+
+        var packet: [UInt8] = [UInt8(0x80 | (send.count + 1)), UInt8(send.count)] + send + [0]
+        packet[packet.count - 1] = checksum(
+            chk: send.count == 1 ? ddcAddress << 1 : (ddcAddress << 1) ^ ddcDataAddress,
+            data: &packet,
+            start: 0,
+            end: packet.count - 2
+        )
+
+        for _ in 0..<5 {
+            usleep(10_000)
+            var writePacket = packet
+            let writeOK = IOAVServiceWriteI2C(
+                service,
+                UInt32(ddcAddress),
+                UInt32(ddcDataAddress),
+                &writePacket,
+                UInt32(writePacket.count)
+            ) == 0
+
+            guard writeOK else {
+                usleep(20_000)
+                continue
+            }
+
+            if reply.isEmpty {
+                return true
+            }
+
+            usleep(50_000)
+            var readReply = reply
+            let readOK = IOAVServiceReadI2C(service, UInt32(ddcAddress), 0, &readReply, UInt32(readReply.count)) == 0
+            if readOK, checksum(chk: 0x50, data: &readReply, start: 0, end: readReply.count - 2) == readReply[readReply.count - 1] {
+                reply = readReply
+                return true
+            }
+
+            usleep(20_000)
+        }
+
+        return false
+    }
+
+    private static func checksum(chk: UInt8, data: inout [UInt8], start: Int, end: Int) -> UInt8 {
+        var value = chk
+        for index in start...end {
+            value ^= data[index]
+        }
+        return value
+    }
+
+    private static func ioregMatchScore(
+        displayID: CGDirectDisplayID,
+        ioregEdidUUID: String,
+        ioDisplayLocation: String,
+        ioregProductName: String,
+        ioregSerialNumber: Int64
+    ) -> Int {
+        var score = 0
+        if let dictionary = CoreDisplay_DisplayCreateInfoDictionary(displayID)?.takeRetainedValue() as NSDictionary? {
+            if
+                let displayLocation = dictionary[kIODisplayLocationKey] as? String,
+                !ioDisplayLocation.isEmpty,
+                displayLocation == ioDisplayLocation
+            {
+                score += 10
+            }
+
+            if
+                let nameList = dictionary["DisplayProductName"] as? [String: String],
+                let name = nameList["en_US"] ?? nameList.first?.value,
+                !ioregProductName.isEmpty,
+                name.caseInsensitiveCompare(ioregProductName) == .orderedSame
+            {
+                score += 1
+            }
+
+            if let serial = dictionary[kDisplaySerialNumber] as? Int64, ioregSerialNumber != 0, serial == ioregSerialNumber {
+                score += 1
+            }
+
+            if
+                let vendorID = dictionary[kDisplayVendorID] as? Int64,
+                let productID = dictionary[kDisplayProductID] as? Int64,
+                let year = dictionary[kDisplayYearOfManufacture] as? Int64,
+                let week = dictionary[kDisplayWeekOfManufacture] as? Int64,
+                let verticalSize = dictionary[kDisplayVerticalImageSize] as? Int64,
+                let horizontalSize = dictionary[kDisplayHorizontalImageSize] as? Int64
+            {
+                struct KeyLoc { let key: String; let loc: Int }
+                let keys: [KeyLoc] = [
+                    .init(key: String(format: "%04x", UInt16(max(0, min(vendorID, 65535)))).uppercased(), loc: 0),
+                    .init(
+                        key: String(format: "%02x", UInt8((UInt16(max(0, min(productID, 65535))) >> 0) & 0xFF)).uppercased()
+                            + String(format: "%02x", UInt8((UInt16(max(0, min(productID, 65535))) >> 8) & 0xFF)).uppercased(),
+                        loc: 4
+                    ),
+                    .init(
+                        key: String(format: "%02x", UInt8(max(0, min(week, 255)))).uppercased()
+                            + String(format: "%02x", UInt8(max(0, min(year - 1990, 255)))).uppercased(),
+                        loc: 19
+                    ),
+                    .init(
+                        key: String(format: "%02x", UInt8(max(0, min(horizontalSize / 10, 255)))).uppercased()
+                            + String(format: "%02x", UInt8(max(0, min(verticalSize / 10, 255)))).uppercased(),
+                        loc: 30
+                    )
+                ]
+                for key in keys where key.key != "0000" && key.key == ioregEdidUUID.prefix(key.loc + 4).suffix(4) {
+                    score += 1
+                }
+            }
+        }
+        return score
+    }
+
+    private static func getIoregServicesForMatching() -> [IOregService] {
+        var services: [IOregService] = []
+        let ioregRoot = IORegistryGetRootEntry(kIOMainPortDefault)
+        defer { IOObjectRelease(ioregRoot) }
+
+        var iterator = io_iterator_t()
+        defer { IOObjectRelease(iterator) }
+
+        guard
+            IORegistryCreateIterator(ioregRoot, kIOServicePlane, IOOptionBits(kIORegistryIterateRecursively), &iterator) == KERN_SUCCESS
+        else {
+            return services
+        }
+
+        var serviceLocation = 0
+        while let node = ioregIterateToNextObjectOfInterest(interests: ["AppleCLCD2", "DCPAVServiceProxy"], iterator: &iterator) {
+            var service = IOregService()
+            if node.name.contains("AppleCLCD2") {
+                service = getIORegServiceAppleCDC2Properties(entry: node.entry)
+                service.serviceLocation = serviceLocation
+                services.append(service)
+                serviceLocation += 1
+            } else if node.name.contains("DCPAVServiceProxy"), !services.isEmpty {
+                var current = services.removeLast()
+                setIORegServiceDCPAVServiceProxy(entry: node.entry, ioregService: &current)
+                services.append(current)
+            }
+            if node.preceedingEntry != IO_OBJECT_NULL {
+                IOObjectRelease(node.preceedingEntry)
+            }
+            IOObjectRelease(node.entry)
+        }
+
+        return services
+    }
+
+    private static func ioregIterateToNextObjectOfInterest(
+        interests: [String],
+        iterator: inout io_iterator_t
+    ) -> (name: String, entry: io_service_t, preceedingEntry: io_service_t)? {
+        var entry: io_service_t = IO_OBJECT_NULL
+        var previous: io_service_t = IO_OBJECT_NULL
+        let name = UnsafeMutablePointer<CChar>.allocate(capacity: MemoryLayout<io_name_t>.size)
+        defer { name.deallocate() }
+
+        while true {
+            previous = entry
+            entry = IOIteratorNext(iterator)
+            guard entry != MACH_PORT_NULL, IORegistryEntryGetName(entry, name) == KERN_SUCCESS else {
+                break
+            }
+            let value = String(cString: name)
+            if interests.contains(where: { value.contains($0) }) {
+                return (value, entry, previous)
+            }
+            if previous != IO_OBJECT_NULL {
+                IOObjectRelease(previous)
+            }
+        }
+
+        if previous != IO_OBJECT_NULL {
+            IOObjectRelease(previous)
+        }
+        return nil
+    }
+
+    private static func getIORegServiceAppleCDC2Properties(entry: io_service_t) -> IOregService {
+        var service = IOregService()
+        if
+            let unmanaged = IORegistryEntryCreateCFProperty(entry, "EDID UUID" as CFString, kCFAllocatorDefault, IOOptionBits(kIORegistryIterateRecursively)),
+            let value = unmanaged.takeRetainedValue() as? String
+        {
+            service.edidUUID = value
+        }
+
+        let path = UnsafeMutablePointer<CChar>.allocate(capacity: MemoryLayout<io_string_t>.size)
+        defer { path.deallocate() }
+        IORegistryEntryGetPath(entry, kIOServicePlane, path)
+        service.ioDisplayLocation = String(cString: path)
+
+        if
+            let unmanaged = IORegistryEntryCreateCFProperty(entry, "DisplayAttributes" as CFString, kCFAllocatorDefault, IOOptionBits(kIORegistryIterateRecursively)),
+            let attrs = unmanaged.takeRetainedValue() as? NSDictionary,
+            let product = attrs.value(forKey: "ProductAttributes") as? NSDictionary
+        {
+            if let productName = product.value(forKey: "ProductName") as? String {
+                service.productName = productName
+            }
+            if let serialNumber = product.value(forKey: "SerialNumber") as? Int64 {
+                service.serialNumber = serialNumber
+            }
+        }
+
+        return service
+    }
+
+    private static func setIORegServiceDCPAVServiceProxy(entry: io_service_t, ioregService: inout IOregService) {
+        if
+            let unmanaged = IORegistryEntryCreateCFProperty(entry, "Location" as CFString, kCFAllocatorDefault, IOOptionBits(kIORegistryIterateRecursively)),
+            let location = unmanaged.takeRetainedValue() as? String
+        {
+            ioregService.location = location
+            if location == "External" {
+                ioregService.service = IOAVServiceCreateWithService(kCFAllocatorDefault, entry)?.takeRetainedValue() as IOAVService
+            }
+        }
+    }
+
+    private static func checkIfDummy(ioregService: IOregService) -> Bool {
+        ioregService.location != "External" && ioregService.location != "Embedded"
+    }
+}
+
+enum DisplayDarkeningRestoreMode {
+    case appleBrightness(Float)
+    case ddcBrightness(UInt16)
+    case overlayOnly
+}
+
+struct DisplayDarkeningSnapshot {
+    let displayID: CGDirectDisplayID
+    let restoreMode: DisplayDarkeningRestoreMode
+}
+
+struct KeyboardBacklightSnapshot {
+    let keyboardID: UInt64
+    let brightness: Float
+    let autoBrightnessEnabled: Bool
+    let idleDimmingSuspended: Bool
+}
+
+final class KeyboardBacklightBlackoutController {
+    private let frameworkPath = "/System/Library/PrivateFrameworks/CoreBrightness.framework"
+    private var client: KeyboardBrightnessClient?
+    private var snapshots: [UInt64: KeyboardBacklightSnapshot] = [:]
+    private var frameworkLoadAttempted = false
+    private var restoreGeneration = 0
+
+    func activate() {
+        restoreGeneration += 1
+        guard snapshots.isEmpty else { return }
+        guard let client = resolveClient() else { return }
+
+        for keyboardID in keyboardIDs(using: client) {
+            let brightness = client.brightness(forKeyboard: keyboardID)
+            let autoBrightnessEnabled = client.isAutoBrightnessEnabled(forKeyboard: keyboardID)
+            let idleDimmingSuspended = client.isIdleDimmingSuspended(onKeyboard: keyboardID)
+
+            snapshots[keyboardID] = KeyboardBacklightSnapshot(
+                keyboardID: keyboardID,
+                brightness: max(0, min(brightness, 1)),
+                autoBrightnessEnabled: autoBrightnessEnabled,
+                idleDimmingSuspended: idleDimmingSuspended
+            )
+
+            if autoBrightnessEnabled {
+                _ = client.enableAutoBrightness(false, forKeyboard: keyboardID)
+            }
+            if !idleDimmingSuspended {
+                _ = client.suspendIdleDimming(true, forKeyboard: keyboardID)
+            }
+            _ = client.setBrightness(0, fadeSpeed: 0, commit: true, forKeyboard: keyboardID)
+        }
+    }
+
+    func deactivate() {
+        guard !snapshots.isEmpty else { return }
+        let pendingSnapshots = Array(snapshots.values)
+        snapshots.removeAll()
+        restoreGeneration += 1
+        let generation = restoreGeneration
+
+        guard let client = resolveClient() else {
+            return
+        }
+
+        for snapshot in pendingSnapshots {
+            prepareKeyboardForManualRestore(snapshot, using: client)
+            restoreBrightness(snapshot, using: client)
+        }
+
+        for delay in [0.12, 0.35, 0.8] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                guard self.restoreGeneration == generation else { return }
+                guard let client = self.resolveClient() else { return }
+                for snapshot in pendingSnapshots {
+                    self.restoreBrightness(snapshot, using: client)
+                }
+            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) { [weak self] in
+            guard let self else { return }
+            guard self.restoreGeneration == generation else { return }
+            guard let client = self.resolveClient() else { return }
+            for snapshot in pendingSnapshots {
+                self.restoreBrightness(snapshot, using: client)
+                self.restoreAutomaticControls(snapshot, using: client)
+            }
+        }
+    }
+
+    private func prepareKeyboardForManualRestore(_ snapshot: KeyboardBacklightSnapshot, using client: KeyboardBrightnessClient) {
+        _ = client.enableAutoBrightness(false, forKeyboard: snapshot.keyboardID)
+        _ = client.suspendIdleDimming(true, forKeyboard: snapshot.keyboardID)
+    }
+
+    private func restoreBrightness(_ snapshot: KeyboardBacklightSnapshot, using client: KeyboardBrightnessClient) {
+        _ = client.setBrightness(max(0, min(snapshot.brightness, 1)), fadeSpeed: 0, commit: true, forKeyboard: snapshot.keyboardID)
+    }
+
+    private func restoreAutomaticControls(_ snapshot: KeyboardBacklightSnapshot, using client: KeyboardBrightnessClient) {
+        _ = client.enableAutoBrightness(snapshot.autoBrightnessEnabled, forKeyboard: snapshot.keyboardID)
+        _ = client.suspendIdleDimming(snapshot.idleDimmingSuspended, forKeyboard: snapshot.keyboardID)
+    }
+
+    private func resolveClient() -> KeyboardBrightnessClient? {
+        if let client {
+            return client
+        }
+        if !frameworkLoadAttempted {
+            frameworkLoadAttempted = true
+            guard Bundle(path: frameworkPath)?.load() == true else {
+                return nil
+            }
+        }
+        guard let clientClass = NSClassFromString("KeyboardBrightnessClient") as? KeyboardBrightnessClient.Type else {
+            return nil
+        }
+        let client = clientClass.init()
+        self.client = client
+        return client
+    }
+
+    private func keyboardIDs(using client: KeyboardBrightnessClient) -> [UInt64] {
+        let ids = (client.copyKeyboardBacklightIDs() as? [NSNumber])?.map { $0.uint64Value } ?? [1]
+        let builtInIDs = ids.filter { client.isKeyboardBuilt(in: $0) }
+        return builtInIDs.isEmpty ? ids : builtInIDs
+    }
+}
+
+final class HardwareBlackoutController {
+    private var snapshots: [CGDirectDisplayID: DisplayDarkeningSnapshot] = [:]
+    private var serviceMatches: [CGDirectDisplayID: Arm64DDC.Arm64Service] = [:]
+    private let keyboardBacklightController = KeyboardBacklightBlackoutController()
+
+    func activate(for screens: [NSScreen]) {
+        refreshMatches(for: screens)
+        for screen in screens {
+            guard let displayID = displayIdentifier(screen) else { continue }
+            guard snapshots[displayID] == nil else { continue }
+
+            if let brightness = getAppleBrightness(displayID) {
+                _ = setAppleBrightness(displayID, value: 0)
+                snapshots[displayID] = DisplayDarkeningSnapshot(displayID: displayID, restoreMode: .appleBrightness(brightness))
+                continue
+            }
+
+            guard let service = serviceMatches[displayID]?.service else {
+                snapshots[displayID] = DisplayDarkeningSnapshot(displayID: displayID, restoreMode: .overlayOnly)
+                continue
+            }
+
+            if let brightness = Arm64DDC.read(service: service, command: DDC_BRIGHTNESS_COMMAND)?.current,
+               Arm64DDC.write(service: service, command: DDC_BRIGHTNESS_COMMAND, value: 0) {
+                snapshots[displayID] = DisplayDarkeningSnapshot(displayID: displayID, restoreMode: .ddcBrightness(brightness))
+                continue
+            }
+
+            snapshots[displayID] = DisplayDarkeningSnapshot(displayID: displayID, restoreMode: .overlayOnly)
+        }
+        keyboardBacklightController.activate()
+    }
+
+    func deactivate(currentScreens: [NSScreen]) {
+        refreshMatches(for: currentScreens)
+        for (displayID, snapshot) in snapshots {
+            switch snapshot.restoreMode {
+            case .appleBrightness(let value):
+                _ = setAppleBrightness(displayID, value: value)
+            case .ddcBrightness(let value):
+                if let service = serviceMatches[displayID]?.service {
+                    _ = Arm64DDC.write(service: service, command: DDC_BRIGHTNESS_COMMAND, value: value)
+                }
+            case .overlayOnly:
+                break
+            }
+        }
+        snapshots.removeAll()
+        keyboardBacklightController.deactivate()
+    }
+
+    private func refreshMatches(for screens: [NSScreen]) {
+        let displayIDs = screens.compactMap(displayIdentifier)
+        serviceMatches = Dictionary(
+            uniqueKeysWithValues: Arm64DDC.getServiceMatches(displayIDs: displayIDs).map { ($0.displayID, $0) }
+        )
+    }
+
+    private func getAppleBrightness(_ displayID: CGDirectDisplayID) -> Float? {
+        var brightness: Float = -1
+        let result = DisplayServicesGetBrightness(displayID, &brightness)
+        guard result == 0, brightness >= 0 else { return nil }
+        return brightness
+    }
+
+    private func setAppleBrightness(_ displayID: CGDirectDisplayID, value: Float) -> Bool {
+        DisplayServicesSetBrightness(displayID, max(0, min(value, 1))) == 0
+    }
+
+    private func displayIdentifier(_ screen: NSScreen) -> CGDirectDisplayID? {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber).map { CGDirectDisplayID($0.uint32Value) }
+    }
+}
+
+final class BlackoutWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+
+    init(screen: NSScreen) {
+        super.init(
+            contentRect: screen.frame,
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false
+        )
+        backgroundColor = .black
+        isOpaque = true
+        hasShadow = false
+        level = .init(rawValue: Int(CGShieldingWindowLevel()))
+        collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        ignoresMouseEvents = false
+        isReleasedWhenClosed = false
+        titleVisibility = .hidden
+        contentView = BlackoutContentView(frame: screen.frame)
+    }
+}
+
+final class BlackoutContentView: NSView {
+    private static let hiddenCursor: NSCursor = {
+        let image = NSImage(size: NSSize(width: 16, height: 16))
+        image.lockFocus()
+        NSColor.clear.set()
+        NSBezierPath(rect: NSRect(x: 0, y: 0, width: 16, height: 16)).fill()
+        image.unlockFocus()
+        return NSCursor(image: image, hotSpot: .zero)
+    }()
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.makeFirstResponder(self)
+        window?.invalidateCursorRects(for: self)
+        Self.hiddenCursor.set()
+    }
+
+    override func resetCursorRects() {
+        discardCursorRects()
+        addCursorRect(bounds, cursor: Self.hiddenCursor)
+    }
+
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {}
+    override func mouseDragged(with event: NSEvent) {}
+    override func rightMouseDown(with event: NSEvent) {}
+    override func rightMouseUp(with event: NSEvent) {}
+    override func rightMouseDragged(with event: NSEvent) {}
+    override func otherMouseDown(with event: NSEvent) {}
+    override func otherMouseUp(with event: NSEvent) {}
+    override func otherMouseDragged(with event: NSEvent) {}
+    override func scrollWheel(with event: NSEvent) {}
+    override func keyDown(with event: NSEvent) {}
+    override func keyUp(with event: NSEvent) {}
+}
+
+final class ScreenBlackoutController {
+    private var windows: [String: BlackoutWindow] = [:]
+    private var screenObserver: NSObjectProtocol?
+    private var cursorHidden = false
+    private var hiddenDisplayIDs: Set<CGDirectDisplayID> = []
+    private let hardwareBlackoutController = HardwareBlackoutController()
+
+    private(set) var isActive = false {
+        didSet {
+            guard oldValue != isActive else { return }
+            NotificationCenter.default.post(
+                name: .awakeBlackoutStateDidChange,
+                object: self,
+                userInfo: ["active": isActive]
+            )
+        }
+    }
+
+    init() {
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.rebuildIfNeeded()
+        }
+    }
+
+    deinit {
+        if let screenObserver {
+            NotificationCenter.default.removeObserver(screenObserver)
+        }
+        deactivate()
+    }
+
+    func toggle() {
+        isActive ? deactivate() : activate()
+    }
+
+    func activate() {
+        guard !isActive else { return }
+        isActive = true
+        rebuildWindows()
+        hardwareBlackoutController.activate(for: NSScreen.screens)
+        if !cursorHidden {
+            NSCursor.hide()
+            cursorHidden = true
+        }
+        hideCursorOnDisplays(NSScreen.screens)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        if let frontWindow = preferredFrontWindow() {
+            frontWindow.makeKeyAndOrderFront(nil)
+            frontWindow.contentView?.window?.makeFirstResponder(frontWindow.contentView)
+        }
+    }
+
+    func deactivate() {
+        guard isActive else { return }
+        hardwareBlackoutController.deactivate(currentScreens: NSScreen.screens)
+        for window in windows.values {
+            window.orderOut(nil)
+            window.close()
+        }
+        windows.removeAll()
+        if cursorHidden {
+            NSCursor.unhide()
+            cursorHidden = false
+        }
+        unhideCursorOnDisplays()
+        isActive = false
+    }
+
+    private func rebuildIfNeeded() {
+        guard isActive else { return }
+        rebuildWindows()
+    }
+
+    private func rebuildWindows() {
+        let screens = NSScreen.screens
+        let activeScreenIDs = Set(screens.map(screenIdentifier))
+
+        let staleScreenIDs = windows.keys.filter { !activeScreenIDs.contains($0) }
+        for screenID in staleScreenIDs {
+            guard let window = windows.removeValue(forKey: screenID) else { continue }
+            window.orderOut(nil)
+            window.close()
+        }
+
+        for screen in screens {
+            let screenID = screenIdentifier(screen)
+            let window = windows[screenID] ?? BlackoutWindow(screen: screen)
+            window.setFrame(screen.frame, display: true)
+            window.level = .init(rawValue: Int(CGShieldingWindowLevel()))
+            window.orderFrontRegardless()
+            window.contentView?.frame = window.frame
+            window.invalidateCursorRects(for: window.contentView ?? NSView())
+            windows[screenID] = window
+        }
+
+        hardwareBlackoutController.activate(for: screens)
+        hideCursorOnDisplays(screens)
+
+        if let frontWindow = preferredFrontWindow() {
+            frontWindow.makeKeyAndOrderFront(nil)
+            frontWindow.contentView?.window?.makeFirstResponder(frontWindow.contentView)
+        }
+    }
+
+    private func preferredFrontWindow() -> BlackoutWindow? {
+        if let mainScreen = NSScreen.main {
+            let mainID = screenIdentifier(mainScreen)
+            if let mainWindow = windows[mainID] {
+                return mainWindow
+            }
+        }
+        return windows.values.first
+    }
+
+    private func screenIdentifier(_ screen: NSScreen) -> String {
+        if let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+            return number.stringValue
+        }
+        return NSStringFromRect(screen.frame)
+    }
+
+    private func hideCursorOnDisplays(_ screens: [NSScreen]) {
+        let currentDisplayIDs = Set(screens.compactMap(displayIdentifier))
+        let newDisplayIDs = currentDisplayIDs.subtracting(hiddenDisplayIDs)
+
+        for displayID in newDisplayIDs {
+            CGDisplayHideCursor(displayID)
+            hiddenDisplayIDs.insert(displayID)
+        }
+
+        let removedDisplayIDs = hiddenDisplayIDs.subtracting(currentDisplayIDs)
+        for displayID in removedDisplayIDs {
+            CGDisplayShowCursor(displayID)
+            hiddenDisplayIDs.remove(displayID)
+        }
+    }
+
+    private func unhideCursorOnDisplays() {
+        for displayID in hiddenDisplayIDs {
+            CGDisplayShowCursor(displayID)
+        }
+        hiddenDisplayIDs.removeAll()
+    }
+
+    private func displayIdentifier(_ screen: NSScreen) -> CGDirectDisplayID? {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber).map { CGDirectDisplayID($0.uint32Value) }
+    }
 }
 
 struct LeaseSnapshot: Decodable, Identifiable {
@@ -730,9 +1549,11 @@ class AwakeViewModel: ObservableObject {
     @Published var updateReleaseURL: String = "https://github.com/nickita-khylkouski/awake/releases/latest"
     @Published var updateChecking: Bool = false
     @Published var updateInFlight: Bool = false
+    @Published var blackoutActive: Bool = false
 
     private var prevState: [String: String] = [:]
     private var timer: AnyCancellable?
+    private var blackoutStateObserver: AnyCancellable?
     private var isFirstRefresh = true
     private let powerMonitor = PowerMonitor()
     private var lastTempFetchAt: Date?
@@ -767,6 +1588,7 @@ class AwakeViewModel: ObservableObject {
         launchAgentInstalled = isLaunchAgentInstalled()
         menuBarControlConfigured = hasMenuBarControlAccess()
         isOnAC = PowerMonitor.isOnAC()
+        blackoutActive = AppDelegate.shared?.isBlackoutActive ?? false
         loadCpuTemperatureHistory()
         if let record = loadOnboardingCompletionRecord(),
            let profile = record.usageProfile.flatMap(AwakeAudience.init(rawValue:)) {
@@ -774,6 +1596,17 @@ class AwakeViewModel: ObservableObject {
         }
 
         NotificationManager.shared.setup()
+        blackoutStateObserver = NotificationCenter.default
+            .publisher(for: .awakeBlackoutStateDidChange)
+            .sink { [weak self] notification in
+                guard let self else { return }
+                guard let active = notification.userInfo?["active"] as? Bool else { return }
+                self.blackoutActive = active
+                self.addLog(
+                    active ? "Blackout ON across all displays" : "Blackout OFF",
+                    color: active ? .blue : .secondary
+                )
+            }
 
         powerMonitor.onPowerChange = { [weak self] onAC in
             guard let self = self else { return }
@@ -1195,7 +2028,7 @@ class AwakeViewModel: ObservableObject {
         snap.isTimer = isTimer
         if isTimer, let endStr = readFile(FOR_END_FILE), let endEpoch = Int(endStr) {
             let remaining = endEpoch - Int(Date().timeIntervalSince1970)
-            snap.timerText = remaining > 0 ? formatDuration(remaining) + " left" : "expiring..."
+        snap.timerText = remaining > 0 ? formatDuration(remaining) + " left" : "expiring..."
         } else if isTimer {
             snap.timerText = "active"
         }
@@ -1203,6 +2036,7 @@ class AwakeViewModel: ObservableObject {
         snap.whyText = truncateForMenu(whyAwakeText)
         snap.warningCount = warnings.count
         snap.showsAIFeatures = showsAIFeatures
+        snap.blackoutActive = AppDelegate.shared?.isBlackoutActive ?? false
         onMenuDataUpdate?(snap)
     }
 
@@ -1478,6 +2312,16 @@ class AwakeViewModel: ObservableObject {
             if isNosleep {
                 runAction("Switching to full nosleep", AWAKE_CMD, ["nosleep"])
             }
+        }
+    }
+
+    func toggleBlackout() {
+        DispatchQueue.main.async {
+            guard let appDelegate = AppDelegate.shared else {
+                self.addLog("Blackout controls are unavailable", color: .red)
+                return
+            }
+            appDelegate.toggleBlackout(nil)
         }
     }
 
@@ -2026,7 +2870,7 @@ struct ContentView: View {
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
 
-                Text("If the menu bar ever feels crowded, reopen Awake from the Dock or with Ctrl+Shift+A.")
+                Text("If the menu bar ever feels crowded, reopen Awake from the Dock or with \(PANEL_HOTKEY_LABEL). Use \(BLACKOUT_HOTKEY_LABEL) to blank every screen.")
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
             }
@@ -2047,7 +2891,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
 
-                Text("Left-click toggles awake. Right-click opens the panel.")
+                Text("Left-click toggles awake. Right-click opens the panel. \(BLACKOUT_HOTKEY_LABEL) blanks every screen.")
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -2421,6 +3265,31 @@ struct ContentView: View {
 
                     Spacer()
                 }
+
+                HStack(alignment: .center, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Blackout every connected display")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text(vm.blackoutActive
+                            ? "All screens are covered by a black overlay until you toggle it off"
+                            : "Turns every display black while the Mac keeps running underneath")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
+
+                    Spacer()
+
+                    Button(vm.blackoutActive ? "Show Screens" : "Blackout Screens") {
+                        vm.toggleBlackout()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .tint(vm.blackoutActive ? .secondary : .black)
+                }
+
+                Text("Hotkey: \(BLACKOUT_HOTKEY_LABEL)")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
             }
 
             HStack(spacing: 6) {
@@ -3092,7 +3961,7 @@ private struct StatusItemHintPopoverView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Awake is here")
                 .font(.system(size: 13, weight: .bold))
-            Text("Look for the bolt or moon icon in your menu bar.\nLeft-click toggles awake. Right-click opens the panel.")
+            Text("Look for the bolt or moon icon in your menu bar.\nLeft-click toggles awake. Right-click opens the panel.\n\(BLACKOUT_HOTKEY_LABEL) blanks every screen.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -3157,12 +4026,18 @@ struct MenuSnapshot {
     var whyText: String = ""
     var warningCount: Int = 0
     var showsAIFeatures: Bool = true
+    var blackoutActive: Bool = false
 }
 
 // MARK: - App Delegate
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     static var shared: AppDelegate?
+
+    private enum HotKeyID: UInt32 {
+        case panel = 1
+        case blackout = 2
+    }
 
     var statusItem: NSStatusItem!
     var panel: AwakePanel!
@@ -3171,6 +4046,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var cachedMenu = MenuSnapshot()
     private var pendingPromotionWorkItem: DispatchWorkItem?
     private var statusItemHintPopover: NSPopover?
+    private let hotKeyController = GlobalHotKeyController()
+    private let blackoutController = ScreenBlackoutController()
+    private var globalKeyMonitor: Any?
+    private var localKeyMonitor: Any?
+
+    var isBlackoutActive: Bool { blackoutController.isActive }
 
     override init() {
         super.init()
@@ -3200,7 +4081,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.target = self
             button.action = #selector(statusItemClicked(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-            button.toolTip = "Awake\nLeft-click: toggle awake\nRight-click: open panel\nHotkey: Ctrl+Shift+A"
+            button.toolTip = buildStatusItemToolTip(isNosleep: false, uptimeText: "")
         }
 
         // No menu assigned — we show it programmatically on right-click
@@ -3211,26 +4092,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         panel.contentViewController = NSHostingController(rootView: ContentView())
         panel.appearance = NSAppearance(named: .aqua)
 
-        // Global hotkey: Ctrl+Shift+A
-        NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.modifierFlags.contains([.control, .shift]) && event.keyCode == 0 {
-                DispatchQueue.main.async { self?.togglePanel(nil) }
-            }
+        let panelHotKeyRegistered = hotKeyController.register(
+            id: HotKeyID.panel.rawValue,
+            keyCode: UInt32(kVK_ANSI_A),
+            modifiers: UInt32(controlKey | shiftKey)
+        ) { [weak self] in
+            self?.togglePanel(nil)
         }
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            if flags.contains([.control, .shift]) && event.keyCode == 0 {
-                DispatchQueue.main.async { self?.togglePanel(nil) }
-                return nil
-            }
-            if flags == .command && event.keyCode == 13 {
-                if self?.panel.isVisible == true {
-                    self?.panel.orderOut(nil)
-                    return nil
-                }
-            }
-            return event
+        let blackoutHotKeyRegistered = hotKeyController.register(
+            id: HotKeyID.blackout.rawValue,
+            keyCode: UInt32(kVK_ANSI_1),
+            modifiers: UInt32(optionKey)
+        ) { [weak self] in
+            self?.toggleBlackout(nil)
         }
+        installKeyboardMonitors(
+            panelHotKeyEnabled: panelHotKeyRegistered,
+            blackoutHotKeyEnabled: blackoutHotKeyRegistered
+        )
 
         // Periodic icon + uptime refresh (every 30s — lightweight)
         iconTimer = Timer.publish(every: 30, on: .main, in: .common)
@@ -3243,6 +4122,62 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.showPanel()
         }
         scheduleStatusItemPromotion()
+    }
+
+    private func installKeyboardMonitors(panelHotKeyEnabled: Bool, blackoutHotKeyEnabled: Bool) {
+        globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return }
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if !panelHotKeyEnabled, flags.contains([.control, .shift]), event.keyCode == UInt16(kVK_ANSI_A) {
+                DispatchQueue.main.async { self.togglePanel(nil) }
+            }
+            if !blackoutHotKeyEnabled, flags.contains(.option), event.keyCode == UInt16(kVK_ANSI_1) {
+                DispatchQueue.main.async { self.toggleBlackout(nil) }
+            }
+        }
+
+        let localEventMask: NSEvent.EventTypeMask = [
+            .keyDown,
+            .keyUp,
+            .flagsChanged,
+            .leftMouseDown,
+            .leftMouseUp,
+            .leftMouseDragged,
+            .rightMouseDown,
+            .rightMouseUp,
+            .rightMouseDragged,
+            .otherMouseDown,
+            .otherMouseUp,
+            .otherMouseDragged,
+            .scrollWheel
+        ]
+
+        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: localEventMask) { [weak self] event in
+            guard let self else { return event }
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+
+            if blackoutController.isActive {
+                if !blackoutHotKeyEnabled, event.type == .keyDown, flags.contains(.option), event.keyCode == UInt16(kVK_ANSI_1) {
+                    DispatchQueue.main.async { self.toggleBlackout(nil) }
+                    return nil
+                }
+                return nil
+            }
+
+            if !panelHotKeyEnabled, flags.contains([.control, .shift]), event.keyCode == UInt16(kVK_ANSI_A) {
+                DispatchQueue.main.async { self.togglePanel(nil) }
+                return nil
+            }
+            if !blackoutHotKeyEnabled, event.type == .keyDown, flags.contains(.option), event.keyCode == UInt16(kVK_ANSI_1) {
+                DispatchQueue.main.async { self.toggleBlackout(nil) }
+                return nil
+            }
+            if flags == .command, event.keyCode == UInt16(kVK_ANSI_W), self.panel.isVisible {
+                self.panel.orderOut(nil)
+                return nil
+            }
+            return event
+        }
     }
 
     @objc func handleGetURLEvent(_ event: NSAppleEventDescriptor, withReplyEvent replyEvent: NSAppleEventDescriptor) {
@@ -3417,6 +4352,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc func toggleBlackout(_ sender: Any?) {
+        if blackoutController.isActive {
+            blackoutController.deactivate()
+        } else {
+            panel.orderOut(nil)
+            blackoutController.activate()
+        }
+        refreshIcon()
+    }
+
+    private func buildStatusItemToolTip(isNosleep: Bool, uptimeText: String) -> String {
+        let uptimeSuffix = uptimeText.isEmpty ? "" : " (\(uptimeText))"
+        let blackoutLine = blackoutController.isActive ? "\nBlackout active on all screens" : ""
+        let stateLine = isNosleep ? "Nosleep active\(uptimeSuffix)" : "Normal sleep"
+        return "Awake\n\(stateLine)\(blackoutLine)\nLeft-click: toggle awake\nRight-click: open panel\nHotkeys: \(PANEL_HOTKEY_LABEL), \(BLACKOUT_HOTKEY_LABEL)"
+    }
+
     // MARK: - Icon & Uptime Refresh
 
     func refreshIcon() {
@@ -3440,8 +4392,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 string: uptimeText.isEmpty ? "" : " \(uptimeText)",
                 attributes: textAttributes
             )
-            let uptimeSuffix = uptimeText.isEmpty ? "" : " (\(uptimeText))"
-            button.toolTip = "Awake\nNosleep active\(uptimeSuffix)\nLeft-click: toggle awake\nRight-click: open panel\nHotkey: Ctrl+Shift+A"
+            button.toolTip = buildStatusItemToolTip(isNosleep: true, uptimeText: uptimeText)
         } else {
             let img = NSImage(systemSymbolName: "moon.zzz", accessibilityDescription: "sleep ok")
             img?.isTemplate = true
@@ -3450,7 +4401,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.contentTintColor = nil
             button.title = ""
             button.attributedTitle = NSAttributedString(string: "", attributes: textAttributes)
-            button.toolTip = "Awake\nNormal sleep\nLeft-click: toggle awake\nRight-click: open panel\nHotkey: Ctrl+Shift+A"
+            button.toolTip = buildStatusItemToolTip(isNosleep: false, uptimeText: "")
         }
     }
 
@@ -3550,6 +4501,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             menu.addItem(NSMenuItem(title: "Nosleep ON", action: #selector(menuNosleepOn), keyEquivalent: ""))
         }
+        menu.addItem(NSMenuItem(
+            title: s.blackoutActive ? "Show Screens (\(BLACKOUT_HOTKEY_LABEL))" : "Blackout Screens (\(BLACKOUT_HOTKEY_LABEL))",
+            action: #selector(menuToggleBlackout),
+            keyEquivalent: ""
+        ))
 
         let timerMenu = NSMenu()
         for dur in ["15m", "30m", "1h", "2h", "4h", "8h"] {
@@ -3596,6 +4552,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             runCommand(AWAKE_CMD, ["yessleep"])
             DispatchQueue.main.async { [weak self] in self?.refreshIcon() }
         }
+    }
+
+    @objc func menuToggleBlackout() {
+        toggleBlackout(nil)
     }
 
     @objc func menuTimerStart(_ sender: NSMenuItem) {
