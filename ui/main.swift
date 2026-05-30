@@ -42,6 +42,8 @@ let AWAKE_REPO_URL = "https://github.com/nickita-khylkouski/awake"
 let PANEL_HOTKEY_LABEL = "Ctrl+Shift+A"
 let BLACKOUT_HOTKEY_LABEL = "Option+1"
 let DDC_BRIGHTNESS_COMMAND: UInt8 = 0x10
+let BATTERY_WARN_THRESHOLD = 15
+let BATTERY_CRITICAL_THRESHOLD = 5
 
 let AGENTS: [String] = {
     if let env = ProcessInfo.processInfo.environment["AWAKE_AGENTS"] {
@@ -1562,6 +1564,7 @@ class AwakeViewModel: ObservableObject {
     private var tempFetchInFlight = false
     private var updateFetchInFlight = false
     private var onboardingEvaluated = false
+    private var criticalBatteryActionTriggered = false
 
     var onStateChange: ((String) -> Void)?
     var onMenuDataUpdate: ((MenuSnapshot) -> Void)?
@@ -1655,6 +1658,38 @@ class AwakeViewModel: ObservableObject {
                     battery: battery, isDaemon: isDaemon, isTimer: isTimer,
                     uptimeVal: uptimeVal, settingsSnapshot: settingsSnapshot, setupSnapshot: setupSnapshot
                 )
+            }
+        }
+    }
+
+    private func handleCriticalBatteryIfNeeded(_ battery: BatteryInfo) {
+        guard let pct = battery.percent else {
+            criticalBatteryActionTriggered = false
+            return
+        }
+
+        guard !battery.charging else {
+            criticalBatteryActionTriggered = false
+            return
+        }
+
+        guard pct <= BATTERY_CRITICAL_THRESHOLD else {
+            criticalBatteryActionTriggered = false
+            return
+        }
+
+        guard !criticalBatteryActionTriggered else { return }
+        criticalBatteryActionTriggered = true
+
+        addLog("Battery CRITICAL: \(pct)% — forcing sleep", color: .red)
+        NotificationManager.shared.send("awake", "Battery critical: \(pct)%. Sleeping now.")
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let (ok, _, err) = runCommandCapture(AWAKE_CMD, ["sleep"], timeout: 15)
+            guard !ok else { return }
+            let detail = err.isEmpty ? "unknown error" : err
+            DispatchQueue.main.async {
+                self?.addLog("Critical battery sleep failed: \(detail)", color: .red)
             }
         }
     }
@@ -1952,7 +1987,7 @@ class AwakeViewModel: ObservableObject {
                     isDaemon ? "Daemon started" : "Daemon stopped")
             }
             if prevState["battery"] != newState["battery"], let pct = battery.percent,
-               pct <= 15 && !battery.charging {
+               pct <= BATTERY_WARN_THRESHOLD && !battery.charging {
                 logEntries.append(LogEntry("Battery LOW: \(pct)%", color: .red))
                 NotificationManager.shared.send("awake", "Battery low: \(pct)%. Plug in soon.")
             }
@@ -1998,11 +2033,12 @@ class AwakeViewModel: ObservableObject {
             batteryPercent = Double(pct)
             batteryCharging = battery.charging
             batteryText = "\(pct)%\(battery.charging ? " charging" : "")"
-            batteryLow = pct <= 15 && !battery.charging
+            batteryLow = pct <= BATTERY_WARN_THRESHOLD && !battery.charging
         } else {
             hasBattery = false
             batteryText = "N/A"
         }
+        handleCriticalBatteryIfNeeded(battery)
 
         if let settingsSnapshot {
             applyPowerSettingsSnapshot(settingsSnapshot)
@@ -4121,7 +4157,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.refreshIcon()
             self?.showPanel()
         }
-        scheduleStatusItemPromotion()
     }
 
     private func installKeyboardMonitors(panelHotKeyEnabled: Bool, blackoutHotKeyEnabled: Bool) {
