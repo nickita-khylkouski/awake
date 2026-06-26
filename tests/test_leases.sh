@@ -222,6 +222,32 @@ grep -q "pmset sleepnow" "$PMSET_LOG"
 
 setup_state
 set_on_battery
+echo 4 > "$PMSET_STATE_DIR/battery-pct"
+sleep 30 &
+timer_pid=$!
+echo "$timer_pid" > "$FOR_PID_FILE"
+echo "timer-token" > "$FOR_TOKEN_FILE"
+echo 9999999999 > "$FOR_END_FILE"
+lease_create_or_update "manual-timer" "timer" "presenting" "Timer lease" 90 "" "test"
+enforce_battery_guard
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if ! kill -0 "$timer_pid" 2>/dev/null; then
+        break
+    fi
+    sleep 0.05
+done
+if kill -0 "$timer_pid" 2>/dev/null; then
+    echo "critical battery did not cancel timer process" >&2
+    kill "$timer_pid" 2>/dev/null || true
+    exit 1
+fi
+[ ! -f "$FOR_PID_FILE" ]
+[ ! -f "$FOR_TOKEN_FILE" ]
+[ ! -f "$FOR_END_FILE" ]
+[ ! -d "$LEASES_DIR/manual-timer" ]
+
+setup_state
+set_on_battery
 touch "$PMSET_STATE_DIR/fail-sleepnow"
 echo 4 > "$PMSET_STATE_DIR/battery-pct"
 enforce_battery_guard
@@ -238,6 +264,25 @@ if enforce_battery_guard; then
     exit 1
 fi
 [ ! -s "$PMSET_LOG" ]
+
+setup_state
+
+lease_create_or_update "daemon-agent" "daemon" "agent-safe" "Detected active coding agents" 70 "" "daemon"
+force_sleep_if_unleased
+grep -q "pmset sleepnow" "$PMSET_LOG"
+[ -f "$PMSET_STATE_DIR/pmset-slept" ]
+
+setup_state
+lease_create_or_update "daemon-agent" "daemon" "agent-safe" "Detected active coding agents" 70 "" "daemon"
+lease_create_or_update "manual-toggle" "manual" "presenting" "Manual lease" 100 "" "test"
+force_sleep_if_unleased
+[ -d "$LEASES_DIR/manual-toggle" ]
+assert_equals "nosleep-full" "$(cat "$STATE_FILE")"
+assert_equals "Manual lease" "$(cat "$WHY_FILE")"
+if grep -q "pmset sleepnow" "$PMSET_LOG"; then
+    echo "daemon grace should not force sleep while manual lease is active" >&2
+    exit 1
+fi
 
 setup_state
 

@@ -661,6 +661,17 @@ pid_is_alive() {
     kill -0 "$pid" 2>/dev/null
 }
 
+wait_for_pid_exit() {
+    local pid="${1:-}"
+    local _attempt
+    [ -n "$pid" ] || return 0
+    for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        pid_is_alive "$pid" || return 0
+        sleep 0.05
+    done
+    return 1
+}
+
 pid_matches_awake_daemon() {
     local pid="${1:-}"
     pid_is_alive "$pid" || return 1
@@ -1048,7 +1059,7 @@ setup_status_json() {
 }
 
 get_battery_pct() {
-    pmset -g batt | grep -Eo '[0-9]+%' | head -1 | tr -d '%'
+    pmset -g batt 2>/dev/null | sed -nE '/InternalBattery|Battery/s/.*[^0-9]([0-9]{1,3})%.*/\1/p' | head -n 1
 }
 
 is_charging() {
@@ -1067,6 +1078,13 @@ enforce_battery_guard() {
         clear_battery_guard_state
         return 1
     fi
+
+    case "$batt" in
+        ''|*[!0-9]*)
+            clear_battery_guard_state
+            return 1
+            ;;
+    esac
 
     stage="$(read_file_value "$BATTERY_GUARD_FILE" 2>/dev/null || true)"
 
@@ -1156,7 +1174,7 @@ current_state() {
 }
 
 on_ac_power() {
-    pmset -g batt | grep -q "AC Power"
+    pmset -g batt 2>/dev/null | head -n 1 | grep -q "AC Power"
 }
 
 current_wifi_ssid() {
@@ -1548,8 +1566,12 @@ elif action == "restore-baseline":
         print("restored")
 elif action == "baseline-get":
     source, key = args[1], args[2]
-    payload = build_payload()
-    value = payload["baseline"].get(source, {}).get(key)
+    baseline = load_baseline()
+    if baseline and baseline.get("active"):
+        value = baseline.get("sources", {}).get(source, {}).get(key)
+    else:
+        payload = build_payload()
+        value = payload["baseline"].get(source, {}).get(key)
     if value is None:
         raise SystemExit(1)
     print(value)
@@ -1620,6 +1642,10 @@ settings_update_baseline() {
 }
 
 restore_normal_sleep_settings() {
+    if [ "$(current_state)" = "normal" ] && [ ! -f "$CAFFEINE_PID_FILE" ] && [ ! -f "$BASELINE_FILE" ]; then
+        rm -f "$WHY_FILE"
+        return 0
+    fi
     if [ -f "$CAFFEINE_PID_FILE" ]; then
         kill "$(cat "$CAFFEINE_PID_FILE")" 2>/dev/null || true
         rm -f "$CAFFEINE_PID_FILE"
@@ -1722,6 +1748,7 @@ activate_yessleep() {
 force_sleep() {
     log "Forcing sleep"
     lease_remove "daemon-agent"
+    cancel_timer_session
     clear_manual_leases
     local dir
     for dir in "$LEASES_DIR"/rule-*; do
@@ -1744,6 +1771,15 @@ force_sleep() {
     osascript -e 'tell application "System Events" to sleep' >/dev/null 2>&1 && return 0
     log "ERROR: Failed to force sleep via pmset sleepnow"
     return 1
+}
+
+force_sleep_if_unleased() {
+    lease_remove "daemon-agent"
+    if [ "$(lease_count)" -eq 0 ]; then
+        force_sleep
+    else
+        reconcile_effective_state
+    fi
 }
 
 cleanup() {
@@ -1985,8 +2021,7 @@ cmd_daemon() {
             if [ "$remaining" -le 0 ]; then
                 log "Grace expired — forcing sleep"
                 notify "awake" "Grace period expired. Sleeping now."
-                lease_remove "daemon-agent"
-                reconcile_effective_state
+                force_sleep_if_unleased
                 grace_start=0
             else
                 if [[ "$(current_state)" == nosleep* ]]; then
@@ -2020,7 +2055,7 @@ cmd_stop() {
     else
         log "Stopping daemon (PID $pid)..."
         kill "$pid"
-        sleep 1
+        wait_for_pid_exit "$pid" || true
         pid_is_alive "$pid" && kill -9 "$pid" 2>/dev/null
         log "Stopped"
     fi
