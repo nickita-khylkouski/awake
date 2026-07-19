@@ -1391,6 +1391,10 @@ why_summary() {
     local id mode resolved reason
     id="$(best_lease_id 2>/dev/null || true)"
     if [ -z "$id" ]; then
+        if unowned_disablesleep_active; then
+            echo "disablesleep is on but Awake did not set it. Run 'awake fix' to clear it."
+            return 0
+        fi
         echo "Normal sleep. No active leases."
         return 0
     fi
@@ -1543,6 +1547,9 @@ warnings_json() {
     if [ "$(lease_count)" -eq 0 ] && ! timer_running && [[ "$(current_state)" == nosleep* ]]; then
         warnings+=("Nosleep state appears stale: no active leases are holding the machine awake")
     fi
+    if unowned_disablesleep_active; then
+        warnings+=("disablesleep is on but Awake did not set it; run 'awake fix' to clear it")
+    fi
     runtime_is_healthy || warnings+=("Awake runtime is unavailable; run awake install to repair it")
     if [ ${#warnings[@]} -eq 0 ]; then
         printf '[]'
@@ -1633,7 +1640,11 @@ def parse_custom():
 
 def parse_disablesleep():
     out = run(["pmset", "-g"])
-    match = re.search(r"^\s*disablesleep\s+(\d+)\s*$", out, re.MULTILINE)
+    match = re.search(
+        r"^\s*(?:disablesleep|sleepdisabled)\s+(\d+)\s*$",
+        out,
+        re.IGNORECASE | re.MULTILINE,
+    )
     return int(match.group(1)) if match else 0
 
 
@@ -1809,7 +1820,8 @@ restore_fallback_sleep_settings() {
 }
 
 current_disablesleep_value() {
-    pmset -g 2>/dev/null | awk '$1 == "disablesleep" { print $2; exit }'
+    pmset -g 2>/dev/null |
+        awk 'tolower($1) == "disablesleep" || tolower($1) == "sleepdisabled" { print $2; exit }'
 }
 
 mark_power_override_active() {
@@ -1878,6 +1890,39 @@ restore_normal_sleep_settings() {
     fi
     echo "normal" > "$STATE_FILE"
     rm -f "$WHY_FILE" "$OVERRIDE_MARKER_FILE"
+}
+
+unowned_disablesleep_active() {
+    [ "$(current_disablesleep_value 2>/dev/null || true)" = "1" ] &&
+        [ "$(lease_count)" -eq 0 ] &&
+        [[ "$(current_state)" != nosleep* ]] &&
+        [ ! -f "$CAFFEINE_PID_FILE" ] &&
+        [ ! -f "$BASELINE_FILE" ] &&
+        [ ! -f "$OVERRIDE_MARKER_FILE" ]
+}
+
+cmd_fix() {
+    if ! unowned_disablesleep_active; then
+        echo "Nothing to fix: no unowned disablesleep override detected."
+        return 0
+    fi
+    if ! acquire_reconcile_lock; then
+        echo "Could not acquire the reconciliation lock; another Awake operation is in progress. Try again in a moment." >&2
+        return 1
+    fi
+    if ! unowned_disablesleep_active; then
+        release_reconcile_lock
+        echo "Nothing to fix: an Awake session is now holding the override."
+        return 0
+    fi
+    if sudo -n pmset -a disablesleep 0 2>/dev/null; then
+        release_reconcile_lock
+        echo "Cleared disablesleep that Awake did not set. Your Mac can sleep normally again."
+    else
+        release_reconcile_lock
+        echo "Could not clear disablesleep (passwordless sudo for pmset required). Run: awake install" >&2
+        return 1
+    fi
 }
 
 apply_presenting_mode() {
@@ -3268,6 +3313,7 @@ case "${1:-}" in
     nosleep)    activate_nosleep ;;
     nosleep-display) activate_nosleep_display ;;
     yessleep)   activate_yessleep ;;
+    fix)        cmd_fix ;;
     status)     shift; cmd_status "$@" ;;
     why)        shift; cmd_why "$@" ;;
     doctor)     shift; cmd_doctor "$@" ;;
@@ -3290,6 +3336,6 @@ case "${1:-}" in
     settings)   shift; cmd_settings "$@" ;;
     setup)      shift; cmd_setup "$@" ;;
     temp)       shift; cmd_temp "$@" ;;
-    *)          echo "Usage: awake [start|stop|sleep|version|on|nosleep|nosleep-display|yessleep|status [--json]|why|doctor|mode ...|update ...|rules ...|agent-auto [on|off|status]|runtime-status|repair-runtime|for <dur>|until <time>|cancel-timer|run <cmd>|ui|screens [show|blackout|toggle]|install|uninstall|settings ...|setup ...|temp [json|value]]"
+    *)          echo "Usage: awake [start|stop|sleep|version|on|nosleep|nosleep-display|yessleep|fix|status [--json]|why|doctor|mode ...|update ...|rules ...|agent-auto [on|off|status]|runtime-status|repair-runtime|for <dur>|until <time>|cancel-timer|run <cmd>|ui|screens [show|blackout|toggle]|install|uninstall|settings ...|setup ...|temp [json|value]]"
                 exit 1 ;;
 esac

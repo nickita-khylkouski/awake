@@ -102,8 +102,12 @@ fi
 
 if [ "${1:-}" = "-g" ]; then
     echo "System-wide power settings:"
-    echo "Currently in use:"
-    echo " disablesleep $(cat "$state_dir/disablesleep")"
+    if [ -f "$state_dir/use-sleepdisabled-format" ]; then
+        printf " SleepDisabled\t\t%s\n" "$(cat "$state_dir/disablesleep")"
+    else
+        echo "Currently in use:"
+        echo " disablesleep $(cat "$state_dir/disablesleep")"
+    fi
     exit 0
 fi
 
@@ -228,6 +232,7 @@ setup_state() {
     : > "$PMSET_LOG"
     set_agents_active 0
     seed_pmset_state
+    rm -f "$PMSET_STATE_DIR/use-sleepdisabled-format"
     mkdir -p "$LEASES_DIR" "$RULES_DIR" "$HOOK_STATE_DIR"
     echo "agent-safe" > "$MODE_FILE"
 }
@@ -487,6 +492,137 @@ test_launch_recovery_leaves_unowned_kernel_setting_alone() {
     [ ! -f "$OVERRIDE_MARKER_FILE" ]
 }
 
+test_fix_clears_unowned_disablesleep() {
+    setup_state fix-clears-unowned
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+    touch "$PMSET_STATE_DIR/use-sleepdisabled-format"
+
+    cmd_fix > "$STATE_ROOT/cmd-out.txt" 2>&1
+
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    assert_contains "Cleared disablesleep that Awake did not set" "$STATE_ROOT/cmd-out.txt"
+    [ ! -f "$RECONCILE_LOCK_FILE" ]
+}
+
+test_disablesleep_parsers_accept_real_mac_format() {
+    setup_state real-mac-format
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+    touch "$PMSET_STATE_DIR/use-sleepdisabled-format"
+
+    assert_equals "1" "$(current_disablesleep_value)"
+    ensure_baseline_snapshot
+
+    assert_contains '"disablesleep": 1' "$BASELINE_FILE"
+}
+
+test_fix_noop_when_no_unowned_override() {
+    setup_state fix-noop-clean
+    echo "0" > "$PMSET_STATE_DIR/disablesleep"
+
+    cmd_fix > "$STATE_ROOT/cmd-out.txt" 2>&1
+
+    assert_contains "Nothing to fix" "$STATE_ROOT/cmd-out.txt"
+    assert_equals "0" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    [ ! -f "$RECONCILE_LOCK_FILE" ]
+}
+
+test_fix_releases_lock_when_pmset_fails() {
+    setup_state fix-pmset-failure
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+    touch "$PMSET_STATE_DIR/use-sleepdisabled-format"
+    export AWAKE_TEST_PMSET_FAIL_WRITE=1
+
+    local rc=0
+    cmd_fix > "$STATE_ROOT/cmd-out.txt" 2>&1 || rc=$?
+
+    unset AWAKE_TEST_PMSET_FAIL_WRITE
+    assert_equals "1" "$rc"
+    assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    assert_contains "Could not clear disablesleep" "$STATE_ROOT/cmd-out.txt"
+    [ ! -f "$RECONCILE_LOCK_FILE" ]
+}
+
+test_fix_refuses_to_clear_owned_session() {
+    setup_state fix-owned-session
+    activate_nosleep >/dev/null
+    assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+
+    cmd_fix > "$STATE_ROOT/cmd-out.txt" 2>&1
+
+    assert_contains "Nothing to fix" "$STATE_ROOT/cmd-out.txt"
+    assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    assert_not_contains "disablesleep 0" "$PMSET_LOG"
+}
+
+test_fix_does_not_clear_while_reconcile_lock_held() {
+    setup_state fix-lock-contention
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+
+    sleep 10 &
+    local holder=$!
+    printf '%s\n' "$holder:0:contend" > "$RECONCILE_LOCK_FILE"
+
+    local rc=0
+    cmd_fix > "$STATE_ROOT/cmd-out.txt" 2>&1 || rc=$?
+
+    kill "$holder" 2>/dev/null || true
+
+    assert_equals "1" "$rc"
+    assert_contains "Could not acquire" "$STATE_ROOT/cmd-out.txt"
+    assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    assert_equals "" "$(cat "$PMSET_LOG")"
+    assert_equals "$holder:0:contend" "$(cat "$RECONCILE_LOCK_FILE")"
+    rm -f "$RECONCILE_LOCK_FILE"
+}
+
+test_unowned_disablesleep_surfaces_in_why() {
+    setup_state unowned-why
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+
+    why_summary > "$STATE_ROOT/cmd-out.txt" 2>&1
+
+    assert_contains "Awake did not set it" "$STATE_ROOT/cmd-out.txt"
+    assert_contains "awake fix" "$STATE_ROOT/cmd-out.txt"
+}
+
+test_unowned_disablesleep_surfaces_in_warnings() {
+    setup_state unowned-warnings
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+
+    warnings_json > "$STATE_ROOT/cmd-out.txt" 2>&1
+
+    assert_contains "Awake did not set it" "$STATE_ROOT/cmd-out.txt"
+    assert_contains "run 'awake fix' to clear it" "$STATE_ROOT/cmd-out.txt"
+}
+
+test_fix_rechecks_ownership_after_acquiring_lock() {
+    setup_state fix-recheck-race
+    echo "1" > "$PMSET_STATE_DIR/disablesleep"
+
+    # Simulate a session that becomes owned between the first guard and the
+    # post-lock recheck: report unowned on the first call, owned on the second.
+    # This exercises the recheck-under-lock branch that closes the race, which
+    # a test that is owned up front never reaches (it bails at the first guard).
+    local saved_fn
+    saved_fn="$(declare -f unowned_disablesleep_active)"
+    __recheck_calls=0
+    unowned_disablesleep_active() {
+        __recheck_calls=$(( __recheck_calls + 1 ))
+        [ "$__recheck_calls" -eq 1 ]
+    }
+
+    local rc=0
+    cmd_fix > "$STATE_ROOT/cmd-out.txt" 2>&1 || rc=$?
+
+    eval "$saved_fn"
+
+    assert_equals "0" "$rc"
+    assert_contains "an Awake session is now holding the override" "$STATE_ROOT/cmd-out.txt"
+    assert_equals "1" "$(cat "$PMSET_STATE_DIR/disablesleep")"
+    assert_equals "" "$(cat "$PMSET_LOG")"
+    [ ! -f "$RECONCILE_LOCK_FILE" ]
+}
+
 test_failed_recovery_keeps_ownership_for_retry() {
     setup_state recovery-retry
     activate_nosleep >/dev/null
@@ -693,6 +829,15 @@ test_restore_without_baseline_falls_back
 test_launch_recovery_restores_after_crashed_daemon
 test_reconcile_repairs_kernel_state_mismatch
 test_launch_recovery_leaves_unowned_kernel_setting_alone
+test_fix_clears_unowned_disablesleep
+test_disablesleep_parsers_accept_real_mac_format
+test_fix_noop_when_no_unowned_override
+test_fix_releases_lock_when_pmset_fails
+test_fix_refuses_to_clear_owned_session
+test_fix_does_not_clear_while_reconcile_lock_held
+test_unowned_disablesleep_surfaces_in_why
+test_unowned_disablesleep_surfaces_in_warnings
+test_fix_rechecks_ownership_after_acquiring_lock
 test_failed_recovery_keeps_ownership_for_retry
 test_runtime_signal_preserves_state_for_supervisor_restart
 test_clean_signal_exit_does_not_request_restart
