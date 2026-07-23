@@ -10,6 +10,7 @@ STATE_ROOT="$TEST_ROOT/state"
 PMSET_STATE_DIR="$TEST_ROOT/pmset"
 PMSET_LOG="$TEST_ROOT/pmset.log"
 OSASCRIPT_LOG="$TEST_ROOT/osascript.log"
+NOTIFY_LOG="$TEST_ROOT/notify.log"
 TEST_HOME="$TEST_ROOT/home"
 mkdir -p "$STUB_BIN" "$STATE_ROOT" "$PMSET_STATE_DIR" "$TEST_HOME/.config/awake"
 
@@ -158,7 +159,7 @@ source "$AWAKE_LIB"
 
 ensure_runtime_ready() { return 0; }
 log() { :; }
-notify() { :; }
+notify() { printf '%s\n' "$*" >> "$NOTIFY_LOG"; }
 active_runtime_pid() { return 1; }
 
 setup_state() {
@@ -185,6 +186,7 @@ setup_state() {
     echo "agent-safe" > "$MODE_FILE"
     : > "$PMSET_LOG"
     : > "$OSASCRIPT_LOG"
+    : > "$NOTIFY_LOG"
     echo 0 > "$PMSET_STATE_DIR/disablesleep"
     echo 50 > "$PMSET_STATE_DIR/battery-pct"
     rm -f "$PMSET_STATE_DIR/on-battery"
@@ -213,6 +215,48 @@ assert_equals() {
         exit 1
     fi
 }
+
+setup_state
+
+# Critical-battery protection belongs to the persistent safety runtime, not to
+# an active Awake lease. It must still force sleep when Never Sleep is off.
+set_on_battery
+echo 5 > "$PMSET_STATE_DIR/battery-pct"
+reconcile_effective_state
+assert_equals "normal" "$(cat "$STATE_FILE")"
+grep -q "pmset displaysleepnow" "$PMSET_LOG"
+grep -q "pmset sleepnow" "$PMSET_LOG"
+[ -f "$PMSET_STATE_DIR/pmset-slept" ]
+
+setup_state
+set_on_battery
+echo 6 > "$PMSET_STATE_DIR/battery-pct"
+reconcile_effective_state
+assert_equals "normal" "$(cat "$STATE_FILE")"
+if grep -q "pmset sleepnow" "$PMSET_LOG"; then
+    echo "zero-lease battery guard forced sleep above BATTERY_CRITICAL" >&2
+    exit 1
+fi
+
+setup_state
+set_on_battery
+echo 15 > "$PMSET_STATE_DIR/battery-pct"
+reconcile_effective_state
+assert_equals "normal" "$(cat "$STATE_FILE")"
+if [ -s "$NOTIFY_LOG" ]; then
+    echo "zero-lease battery guard emitted an active-session warning" >&2
+    exit 1
+fi
+
+setup_state
+set_charging
+echo 4 > "$PMSET_STATE_DIR/battery-pct"
+reconcile_effective_state
+assert_equals "normal" "$(cat "$STATE_FILE")"
+if grep -q "pmset sleepnow" "$PMSET_LOG"; then
+    echo "zero-lease battery guard forced sleep while charging" >&2
+    exit 1
+fi
 
 setup_state
 

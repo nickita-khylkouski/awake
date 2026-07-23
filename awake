@@ -1249,6 +1249,7 @@ clear_battery_guard_state() {
 }
 
 enforce_battery_guard() {
+    local scope="${1:-active-session}"
     local batt stage=""
     batt="$(get_battery_pct 2>/dev/null || true)"
 
@@ -1274,6 +1275,12 @@ enforce_battery_guard() {
         printf 'critical\n' > "$BATTERY_GUARD_FILE"
         force_sleep
         return 0
+    fi
+
+    # The runtime checks the critical threshold even when Awake has no active
+    # lease. Keep ordinary low-battery warnings scoped to active sessions.
+    if [ "$scope" = "critical-only" ]; then
+        return 1
     fi
 
     if [ "$batt" -le "$BATTERY_WARN" ] 2>/dev/null; then
@@ -1976,6 +1983,13 @@ apply_running_mode() {
 reconcile_effective_state_impl() {
     cleanup_expired_leases
     cleanup_stale_agent_lease
+
+    # Battery protection is a property of the persistent safety runtime, so it
+    # must run before the no-lease fast path used when Never Sleep is off.
+    if enforce_battery_guard critical-only; then
+        return 0
+    fi
+
     local id mode resolved reason
     id="$(best_lease_id 2>/dev/null || true)"
     if [ -z "$id" ]; then
