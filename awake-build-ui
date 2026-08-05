@@ -26,7 +26,7 @@ trap cleanup EXIT
 [ -f "$SOURCE" ] || { echo "Missing $SOURCE" >&2; exit 1; }
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$DESTINATION"
 
-frameworks=(-framework AppKit -framework Carbon -framework IOKit -framework ServiceManagement)
+frameworks=(-framework AppKit -framework Carbon -framework IOKit -framework ServiceManagement -framework SwiftUI)
 for arch in arm64 x86_64; do
     echo "Building Awake for $arch..."
     xcrun swiftc -O -target "$arch-apple-macos13.0" "${frameworks[@]}" \

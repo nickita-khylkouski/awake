@@ -2,6 +2,7 @@ import AppKit
 import Carbon
 import IOKit.pwr_mgt
 import ServiceManagement
+import SwiftUI
 
 private let stateURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".config/awake/state.json")
@@ -299,16 +300,32 @@ final class GlobalHotKey {
     private var reference: EventHotKeyRef?
     private var handler: EventHandlerRef?
     private let action: () -> Void
+    private let identifier: EventHotKeyID
     private(set) var isRegistered = false
 
-    init(action: @escaping () -> Void) {
+    init(keyCode: UInt32 = UInt32(kVK_ANSI_1), modifiers: UInt32 = UInt32(optionKey), id: UInt32 = 1, action: @escaping () -> Void) {
         self.action = action
+        self.identifier = EventHotKeyID(signature: fourCC("AWAK"), id: id)
         var event = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(
             GetApplicationEventTarget(),
-            { _, _, pointer in
-                guard let pointer else { return noErr }
-                Unmanaged<GlobalHotKey>.fromOpaque(pointer).takeUnretainedValue().action()
+            { _, event, pointer in
+                guard let event, let pointer else { return OSStatus(eventNotHandledErr) }
+                let hotKey = Unmanaged<GlobalHotKey>.fromOpaque(pointer).takeUnretainedValue()
+                var received = EventHotKeyID()
+                let status = GetEventParameter(
+                    event,
+                    EventParamName(kEventParamDirectObject),
+                    EventParamType(typeEventHotKeyID),
+                    nil,
+                    MemoryLayout<EventHotKeyID>.size,
+                    nil,
+                    &received
+                )
+                guard status == noErr, received.signature == hotKey.identifier.signature, received.id == hotKey.identifier.id else {
+                    return OSStatus(eventNotHandledErr)
+                }
+                hotKey.action()
                 return noErr
             },
             1,
@@ -316,8 +333,7 @@ final class GlobalHotKey {
             Unmanaged.passUnretained(self).toOpaque(),
             &handler
         )
-        let identifier = EventHotKeyID(signature: fourCC("AWAK"), id: 1)
-        isRegistered = RegisterEventHotKey(UInt32(kVK_ANSI_1), UInt32(optionKey), identifier, GetApplicationEventTarget(), 0, &reference) == noErr
+        isRegistered = RegisterEventHotKey(keyCode, modifiers, identifier, GetApplicationEventTarget(), 0, &reference) == noErr
     }
 
     deinit {
@@ -326,12 +342,130 @@ final class GlobalHotKey {
     }
 }
 
+struct AwakePanelView: View {
+    let active: Bool
+    let restorationPending: Bool
+    let statusText: String
+    let keepDisplayOn: Bool
+    let keepWorkingWithLidClosed: Bool
+    let supportsClosedLid: Bool
+    let closedLidNeedsSetup: Bool
+    let blackoutActive: Bool
+    let launchAtLogin: Bool
+    let toggleSession: () -> Void
+    let setDuration: (Int) -> Void
+    let toggleDisplay: () -> Void
+    let toggleClosedLid: () -> Void
+    let toggleBlackout: () -> Void
+    let toggleLogin: () -> Void
+    let restoreNormalSleep: () -> Void
+    let showAbout: () -> Void
+    let quit: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
+                Image(systemName: restorationPending ? "exclamationmark.triangle.fill" : (active ? "bolt.fill" : "moon.fill"))
+                    .font(.system(size: 23, weight: .semibold))
+                    .frame(width: 34, height: 34)
+                    .foregroundStyle(active ? Color.accentColor : Color.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Awake").font(.headline)
+                    Text(statusText).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            Button(action: toggleSession) {
+                Label(active ? "Turn Awake Off" : "Keep Mac Awake", systemImage: active ? "power" : "bolt.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .controlSize(.large)
+            .buttonStyle(.borderedProminent)
+
+            if restorationPending {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Normal sleep needs restoring").font(.subheadline.weight(.semibold))
+                    Text("Awake kept the recovery record. Restore the previous system setting now.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Restore Normal Sleep", action: restoreNormalSleep).buttonStyle(.bordered)
+                }
+                .padding(11)
+                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 9))
+            } else if closedLidNeedsSetup {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Closed-lid mode needs setup").font(.subheadline.weight(.semibold))
+                    Text("Approve one narrow system permission to keep a MacBook working when its lid is closed.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Set Up Closed-Lid Mode", action: toggleClosedLid)
+                        .buttonStyle(.bordered)
+                }
+                .padding(11)
+                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 9))
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text(active ? "Replace with a timer" : "Start a timer")
+                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 3), spacing: 6) {
+                    timerButton("15m", 15 * 60)
+                    timerButton("30m", 30 * 60)
+                    timerButton("1h", 60 * 60)
+                    timerButton("2h", 2 * 60 * 60)
+                    timerButton("4h", 4 * 60 * 60)
+                    timerButton("8h", 8 * 60 * 60)
+                }
+            }
+
+            Divider()
+
+            Toggle("Keep Display On", isOn: Binding(get: { keepDisplayOn }, set: { _ in toggleDisplay() }))
+            if supportsClosedLid && !closedLidNeedsSetup {
+                Toggle("Keep Working with Lid Closed", isOn: Binding(get: { keepWorkingWithLidClosed }, set: { _ in toggleClosedLid() }))
+            }
+
+            Button(action: toggleBlackout) {
+                Label(blackoutActive ? "Restore Screens" : "Black Out Screens", systemImage: blackoutActive ? "eye.fill" : "eye.slash.fill")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+
+            Toggle("Launch at Login", isOn: Binding(get: { launchAtLogin }, set: { _ in toggleLogin() }))
+
+            Divider()
+
+            HStack {
+                Button("About", action: showAbout).buttonStyle(.plain)
+                Spacer()
+                Button("Quit", action: quit).buttonStyle(.plain)
+            }
+            .font(.caption)
+        }
+        .padding(16)
+        .frame(width: 330, height: 460, alignment: .top)
+    }
+
+    private func timerButton(_ label: String, _ seconds: Int) -> some View {
+        Button(label) { setDuration(seconds) }
+            .buttonStyle(.bordered)
+            .frame(maxWidth: .infinity)
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let assertion = WakeAssertion()
     private let closedLid = ClosedLidController()
     private let blackout = BlackoutController()
     private var hotKey: GlobalHotKey?
+    private var panelHotKey: GlobalHotKey?
     private var statusItem: NSStatusItem!
+    private let popover = NSPopover()
+    private let quickMenu = NSMenu()
+    private var panelController: NSHostingController<AwakePanelView>?
+    private var standalonePanel: NSPanel?
+    private var standaloneController: NSHostingController<AwakePanelView>?
     private var timer: Timer?
     private var commandTimer: Timer?
     private var deadline: Date?
@@ -346,19 +480,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         closedLid.recoverInterruptedSession()
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.menu = NSMenu()
-        statusItem.menu?.delegate = self
+        if closedLid.isSupportedMac && !closedLid.setupComplete {
+            keepWorkingWithLidClosed = false
+            UserDefaults.standard.set(false, forKey: "keepWorkingWithLidClosed")
+        }
+        let positionKey = "NSStatusItem Preferred Position com.awake.menubar.primary"
+        if UserDefaults.standard.object(forKey: positionKey) == nil {
+            UserDefaults.standard.set(150, forKey: positionKey)
+        }
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.isVisible = true
+        statusItem.autosaveName = "com.awake.menubar.primary"
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(statusItemClicked)
+        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        statusItem.button?.imagePosition = .imageLeading
+        quickMenu.delegate = self
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentSize = NSSize(width: 330, height: 460)
         hotKey = GlobalHotKey { [weak self] in self?.toggleBlackout() }
+        panelHotKey = GlobalHotKey(
+            keyCode: UInt32(kVK_ANSI_A),
+            modifiers: UInt32(controlKey | shiftKey),
+            id: 2
+        ) { [weak self] in self?.toggleStandalonePanel() }
         updateUI()
         writeState()
         if restorationPending { handleRestoreFailure() }
-        if !closedLid.isSupportedMac { offerLegacyCleanupIfNeeded() }
-        showOnboardingIfNeeded()
         commandTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.processCommand()
         }
         if let commandTimer { RunLoop.main.add(commandTimer, forMode: .common) }
+        if !closedLid.isSupportedMac {
+            DispatchQueue.main.async { [weak self] in self?.offerLegacyCleanupIfNeeded() }
+        }
+        if closedLid.isSupportedMac && !closedLid.setupComplete && !UserDefaults.standard.bool(forKey: "didPresentPanelOnboarding") {
+            UserDefaults.standard.set(true, forKey: "didPresentPanelOnboarding")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.showStandalonePanel() }
+        }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showStandalonePanel()
+        return false
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -376,6 +541,112 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuDidClose(_ menu: NSMenu) {
         menuIsOpen = false
         updateUI()
+    }
+
+    @objc private func statusItemClicked() {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            if let button = statusItem.button {
+                quickMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.minY), in: button)
+            }
+        } else {
+            togglePanel()
+        }
+    }
+
+    private func togglePanel() {
+        popover.isShown ? popover.performClose(nil) : showPanel()
+    }
+
+    private func toggleStandalonePanel() {
+        if standalonePanel?.isVisible == true { standalonePanel?.orderOut(nil) }
+        else { showStandalonePanel() }
+    }
+
+    private func showPanel() {
+        guard let button = statusItem.button else { return }
+        updatePanel()
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func showStandalonePanel() {
+        let view = makePanelView()
+        let controller: NSHostingController<AwakePanelView>
+        if let standaloneController {
+            standaloneController.rootView = view
+            controller = standaloneController
+        } else {
+            controller = NSHostingController(rootView: view)
+            standaloneController = controller
+        }
+        let panel: NSPanel
+        if let standalonePanel {
+            panel = standalonePanel
+        } else {
+            panel = NSPanel(
+                contentRect: NSRect(x: 0, y: 0, width: 330, height: 460),
+                styleMask: [.titled, .closable, .utilityWindow],
+                backing: .buffered,
+                defer: false
+            )
+            panel.title = "Awake"
+            panel.isReleasedWhenClosed = false
+            panel.level = .floating
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            panel.contentViewController = controller
+            self.standalonePanel = panel
+        }
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func updatePanel() {
+        let view = makePanelView()
+        if let panelController {
+            panelController.rootView = view
+        } else {
+            let controller = NSHostingController(rootView: view)
+            panelController = controller
+            popover.contentViewController = controller
+        }
+        if standalonePanel?.isVisible == true { standaloneController?.rootView = view }
+    }
+
+    private func makePanelView() -> AwakePanelView {
+        let active = assertion.isActive
+        let status = restorationPending
+            ? "Normal sleep needs restoring"
+            : deadline.map { "\(formatRemaining($0.timeIntervalSinceNow)) remaining" } ?? (active ? "On indefinitely" : "Normal sleep allowed")
+        let loginEnabled: Bool
+        if #available(macOS 13.0, *) { loginEnabled = SMAppService.mainApp.status == .enabled }
+        else { loginEnabled = false }
+        return AwakePanelView(
+            active: active,
+            restorationPending: restorationPending,
+            statusText: status,
+            keepDisplayOn: keepDisplayOn,
+            keepWorkingWithLidClosed: keepWorkingWithLidClosed,
+            supportsClosedLid: closedLid.isSupportedMac,
+            closedLidNeedsSetup: closedLid.isSupportedMac && !closedLid.setupComplete,
+            blackoutActive: blackout.isActive,
+            launchAtLogin: loginEnabled,
+            toggleSession: { [weak self] in
+                guard let self else { return }
+                if self.assertion.isActive { self.stop() }
+                else { _ = self.start(until: nil) }
+            },
+            setDuration: { [weak self] seconds in _ = self?.start(until: Date().addingTimeInterval(TimeInterval(seconds))) },
+            toggleDisplay: { [weak self] in self?.toggleDisplay() },
+            toggleClosedLid: { [weak self] in self?.toggleClosedLid() },
+            toggleBlackout: { [weak self] in self?.toggleBlackout() },
+            toggleLogin: { [weak self] in
+                if #available(macOS 13.0, *) { self?.toggleLogin() }
+            },
+            restoreNormalSleep: { [weak self] in self?.restoreNormalSleep() },
+            showAbout: { [weak self] in self?.showAbout() },
+            quit: { [weak self] in self?.quit() }
+        )
     }
 
     private func rebuildMenu(_ menu: NSMenu) {
@@ -445,7 +716,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ("For 15 Minutes", 15 * 60),
         ("For 30 Minutes", 30 * 60),
         ("For 1 Hour", 60 * 60),
-        ("For 2 Hours", 2 * 60 * 60)
+        ("For 2 Hours", 2 * 60 * 60),
+        ("For 4 Hours", 4 * 60 * 60),
+        ("For 8 Hours", 8 * 60 * 60)
     ]
 
     private func durationMenu(extends: Bool) -> NSMenu {
@@ -478,10 +751,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func start(until: Date?) -> Bool {
         let wasActive = assertion.isActive
         if keepWorkingWithLidClosed && !closedLid.setupComplete {
-            if !offerClosedLidSetup() {
-                keepWorkingWithLidClosed = false
-                UserDefaults.standard.set(false, forKey: "keepWorkingWithLidClosed")
-            }
+            keepWorkingWithLidClosed = false
+            UserDefaults.standard.set(false, forKey: "keepWorkingWithLidClosed")
+            DispatchQueue.main.async { [weak self] in self?.showStandalonePanel() }
         }
         if keepWorkingWithLidClosed && !closedLid.enable() {
             keepWorkingWithLidClosed = false
@@ -551,50 +823,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         UserDefaults.standard.set(keepWorkingWithLidClosed, forKey: "keepWorkingWithLidClosed")
-        updateUI()
-        writeState()
-    }
-
-    private func showOnboardingIfNeeded() {
-        guard closedLid.isSupportedMac else {
-            keepWorkingWithLidClosed = false
-            UserDefaults.standard.set(false, forKey: "keepWorkingWithLidClosed")
-            UserDefaults.standard.set(true, forKey: "onboardingComplete")
-            return
-        }
-        guard !UserDefaults.standard.bool(forKey: "onboardingComplete") else { return }
-        NSApp.activate(ignoringOtherApps: true)
-        let ready = closedLid.setupComplete
-        let alert = NSAlert()
-        alert.messageText = "Keep working with the lid closed"
-        alert.informativeText = "Awake installs a narrow system permission to toggle closed-lid sleep without asking for a password each time. It restores your previous setting when Awake stops. If Awake is force-quit or loses power, it restores the setting next time it opens. Keep a closed MacBook ventilated and never put it in a bag while this mode is on."
-        alert.icon = NSImage(systemSymbolName: "lock.shield", accessibilityDescription: "Administrator approval")
-        alert.addButton(withTitle: ready ? "Continue" : "Set Up")
-        alert.addButton(withTitle: "Not Now")
-        if alert.runModal() == .alertFirstButtonReturn {
-            if ready || closedLid.installPermission() {
-                keepWorkingWithLidClosed = true
-                UserDefaults.standard.set(true, forKey: "keepWorkingWithLidClosed")
-                UserDefaults.standard.set(true, forKey: "onboardingComplete")
-            } else {
-                keepWorkingWithLidClosed = false
-                UserDefaults.standard.set(false, forKey: "keepWorkingWithLidClosed")
-                UserDefaults.standard.set(true, forKey: "onboardingComplete")
-                showClosedLidError()
-            }
-        } else {
-            keepWorkingWithLidClosed = false
-            UserDefaults.standard.set(false, forKey: "keepWorkingWithLidClosed")
-            if closedLid.legacyPermissionPresent {
-                let cleanup = NSAlert()
-                cleanup.messageText = "Remove old Awake permissions"
-                cleanup.informativeText = "A previous Awake version installed broad power and temperature permissions. They are no longer needed and should be removed."
-                cleanup.addButton(withTitle: "Remove")
-                cleanup.addButton(withTitle: "Later")
-                if cleanup.runModal() == .alertFirstButtonReturn { _ = closedLid.removeLegacyPermission() }
-            }
-            UserDefaults.standard.set(!closedLid.legacyPermissionPresent, forKey: "onboardingComplete")
-        }
         updateUI()
         writeState()
     }
@@ -673,7 +901,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.messageText = "Awake"
         alert.icon = NSImage(systemSymbolName: "cup.and.saucer.fill", accessibilityDescription: "Awake")
         let shortcut = hotKey?.isRegistered == true ? "Press Option-1 or Escape to restore them." : "Press Escape or click to restore them."
-        alert.informativeText = "When Awake is on, it prevents idle sleep and can keep a MacBook working with its lid closed. A timer turns Awake off and restores normal sleep at zero.\n\nScreen blackout covers every display. \(shortcut)"
+        let panelShortcut = panelHotKey?.isRegistered == true ? "Press Control-Shift-A to open the control panel.\n\n" : ""
+        alert.informativeText = "When Awake is on, it prevents idle sleep and can keep a MacBook working with its lid closed. A timer turns Awake off and restores normal sleep at zero.\n\n\(panelShortcut)Screen blackout covers every display. \(shortcut)"
         alert.addButton(withTitle: "OK")
         alert.runModal()
     }
@@ -686,17 +915,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateUI() {
         let active = assertion.isActive
-        let symbol = restorationPending ? "exclamationmark.triangle.fill" : (active ? "cup.and.saucer.fill" : "cup.and.saucer")
+        let symbol = restorationPending ? "exclamationmark.triangle.fill" : (active ? "bolt.fill" : "moon.fill")
         let description = restorationPending ? "Normal sleep needs restoring" : (active ? "Awake is on" : "Awake is off")
         statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: description)
-        statusItem.button?.toolTip = restorationPending ? "Awake: Normal sleep needs restoring" : (deadline.map { "Awake: \(formatRemaining($0.timeIntervalSinceNow)) remaining" } ?? (active ? "Awake: On" : "Awake: Off"))
+        statusItem.button?.title = deadline.map { " \(formatRemaining($0.timeIntervalSinceNow))" } ?? " Awake"
+        let stateTooltip = restorationPending ? "Normal sleep needs restoring" : (deadline.map { "\(formatRemaining($0.timeIntervalSinceNow)) remaining" } ?? (active ? "On" : "Off"))
+        statusItem.button?.toolTip = "Awake: \(stateTooltip)\nLeft-click: controls  Right-click: quick menu\nControl-Shift-A: open controls  Option-1: blackout"
         statusItem.button?.setAccessibilityLabel("Awake")
         statusItem.button?.setAccessibilityValue(restorationPending ? "Normal sleep needs restoring" : (deadline.map { "\(formatRemaining($0.timeIntervalSinceNow)) remaining" } ?? (active ? "On indefinitely" : "Off")))
         if menuIsOpen && active {
             activeStatusMenuItem?.title = deadline.map { "Awake for \(formatRemaining($0.timeIntervalSinceNow))" } ?? "Awake indefinitely"
-        } else if let menu = statusItem.menu {
-            rebuildMenu(menu)
         }
+        if popover.isShown || standalonePanel?.isVisible == true { updatePanel() }
     }
 
     private func writeState() {
@@ -740,7 +970,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case "blackout": if !blackout.isActive { toggleBlackout() }
         case "show": if blackout.isActive { toggleBlackout() }
         case "toggle-blackout": toggleBlackout()
-        case "menu": statusItem.button?.performClick(nil)
+        case "menu": showStandalonePanel()
         case "about": showAbout()
         default: break
         }

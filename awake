@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="3.1.0"
+VERSION="3.2.0"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 while [ -L "$SCRIPT_PATH" ]; do
     SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
@@ -260,7 +260,7 @@ case "$command" in
         send_url "awake://show"
         ;;
     ui)
-        "$OPEN_BIN" -g "$APP_PATH"
+        send_url "awake://menu"
         ;;
     menu)
         send_url "awake://menu"

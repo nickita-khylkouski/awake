@@ -18,11 +18,11 @@ For a local checkout:
 ./install.sh
 ```
 
-The installer builds a universal Apple Silicon and Intel app at `~/.local/bin/Awake.app`, opens it, and starts an indefinite session. After that, use the cup icon in the menu bar.
+The installer builds a universal Apple Silicon and Intel app at `~/.local/bin/Awake.app`, opens it, and starts an indefinite session. After that, use the labeled moon or bolt in the menu bar. Left-click opens the control panel and right-click opens the quick menu. If a menu-bar organizer hides it, press `Control-Shift-A` or run `awake ui`.
 
 ## Menu
 
-- Start indefinitely, or for 15 minutes, 30 minutes, 1 hour, or 2 hours
+- Start indefinitely, or for 15 minutes, 30 minutes, 1, 2, 4, or 8 hours
 - Stop at any time
 - Keep Display On is optional and off by default
 - Keep Working With Lid Closed uses one administrator-approved power setting
@@ -30,6 +30,8 @@ The installer builds a universal Apple Silicon and Intel app at `~/.local/bin/Aw
 - Launch at Login uses the standard macOS login-item service
 
 Press `Option-1` to toggle screen blackout. `Escape` also restores the screens. Blackout never changes physical monitor or keyboard brightness.
+
+Selecting a timer while Awake is already on replaces the indefinite session with that deadline. The right-click quick menu also has a separate Extend action for an existing timer.
 
 Timers use an absolute deadline and release the power assertion as soon as they reach zero. Awake never forces the Mac to sleep. It only prevents or allows normal idle sleep.
 
@@ -61,4 +63,4 @@ npm test
 
 Local builds are ad-hoc signed. Public distribution still requires Apple Developer ID signing and notarization.
 
-![Awake closed-lid onboarding](awake-screenshot.jpg)
+![Awake menu-bar control panel](awake-screenshot.jpg)

@@ -12,7 +12,7 @@ bash -n "$ROOT/awake" "$ROOT/awake-power" "$ROOT/awake-build-ui" "$ROOT/install.
 pass "shell syntax"
 
 xcrun swiftc -target arm64-apple-macos13.0 \
-    -framework AppKit -framework Carbon -framework IOKit -framework ServiceManagement \
+    -framework AppKit -framework Carbon -framework IOKit -framework ServiceManagement -framework SwiftUI \
     -typecheck "$ROOT/ui/main.swift"
 pass "Swift typecheck at macOS 13 deployment target"
 
@@ -87,7 +87,7 @@ pass "multi-user power ownership and prior-state restoration"
 tarball="$(cd "$ROOT" && npm pack --silent --pack-destination "$TMP" | tail -1)"
 npm install --silent --prefix "$TMP/npm" "$TMP/$tarball"
 version="$($TMP/npm/node_modules/.bin/awake --version)"
-[ "$version" = "awake-agent 3.1.0" ] || fail "npm bin symlink resolution"
+[ "$version" = "awake-agent 3.2.0" ] || fail "npm bin symlink resolution"
 [ -x "$TMP/npm/node_modules/awake-agent/awake-build-ui" ] || fail "npm build helper missing"
 pass "npm package entrypoint"
 
