@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="3.0.0"
+VERSION="3.1.0"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 while [ -L "$SCRIPT_PATH" ]; do
     SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
@@ -12,6 +12,7 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
 APP_PATH="${AWAKE_APP_PATH:-$HOME/.local/bin/Awake.app}"
 STATE_FILE="${AWAKE_STATE_FILE:-$HOME/.config/awake/state.json}"
 COMMAND_FILE="${AWAKE_COMMAND_FILE:-$HOME/.config/awake/command}"
+CLOSED_LID_MARKER="${AWAKE_CLOSED_LID_MARKER:-$HOME/.config/awake/closed-lid-active}"
 OPEN_BIN="${AWAKE_OPEN_BIN:-/usr/bin/open}"
 
 usage() {
@@ -108,6 +109,9 @@ elif state.get("remainingSeconds") is not None:
 else:
     print("Awake is on indefinitely")
 print("Display: kept on" if state.get("keepDisplayOn") else "Display: may sleep")
+print("Closed lid: active" if state.get("closedLidActive") else "Closed lid: off")
+if state.get("restoreFailed"):
+    print("Warning: normal sleep needs restoring")
 PY
 }
 
@@ -165,6 +169,23 @@ PY
 
 }
 
+remove_power_permission() {
+    local username uid permission rule old_pmset old_metrics shell escaped
+    username="$(id -un)"
+    uid="$(id -u)"
+    [[ "$username" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Cannot validate the current username." >&2; return 1; }
+    permission="/etc/sudoers.d/awake-$uid"
+    [ -e "$permission" ] || [ -e /etc/sudoers.d/pmset ] || [ -e /etc/sudoers.d/powermetrics ] || return 0
+    rule="$username ALL=(root) NOPASSWD: /Library/PrivilegedHelperTools/com.awake/awake-power on $uid, /Library/PrivilegedHelperTools/com.awake/awake-power off $uid"
+    old_pmset="$username ALL=(ALL) NOPASSWD: /usr/bin/pmset"
+    old_metrics="$username ALL=(ALL) NOPASSWD: /usr/bin/powermetrics"
+    shell="if [ -f '$permission' ] && [ \"\$(/bin/cat '$permission')\" = '$rule' ]; then /bin/rm -f '$permission'; fi; if [ -f /etc/sudoers.d/pmset ] && [ \"\$(/bin/cat /etc/sudoers.d/pmset)\" = '$old_pmset' ]; then /bin/rm -f /etc/sudoers.d/pmset; fi; if [ -f /etc/sudoers.d/powermetrics ] && [ \"\$(/bin/cat /etc/sudoers.d/powermetrics)\" = '$old_metrics' ]; then /bin/rm -f /etc/sudoers.d/powermetrics; fi; set -- /etc/sudoers.d/awake-*; if [ ! -e \"\$1\" ]; then /bin/rm -rf /Library/PrivilegedHelperTools/com.awake; fi"
+    escaped="${shell//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    /usr/bin/osascript -e "do shell script \"$escaped\" with administrator privileges" || return 1
+    [ ! -e "$permission" ] || return 1
+}
+
 install_awake() {
     local build="$SCRIPT_DIR/awake-build-ui"
     [ -x "$build" ] || { echo "awake-build-ui was not found beside awake" >&2; return 1; }
@@ -177,19 +198,35 @@ install_awake() {
     sleep 1
     send_url "awake://start"
     remove_legacy_integrations
-    echo "Awake is installed and active. Use its menu bar icon to control it."
+    echo "Awake is installed. Finish onboarding if prompted; the queued session will start afterward."
 }
 
 uninstall_awake() {
     send_url "awake://stop" 2>/dev/null || true
     send_url "awake://show" 2>/dev/null || true
     terminate_installed_app
+    if [ -f "$CLOSED_LID_MARKER" ]; then
+        if [ "$(tr -d '[:space:]' < "$CLOSED_LID_MARKER")" != "owned" ]; then
+            echo "Warning: the closed-lid recovery record is invalid. Reopen Awake to repair it." >&2
+            return 1
+        fi
+        if /usr/bin/sudo -n /Library/PrivilegedHelperTools/com.awake/awake-power off "$(id -u)" 2>/dev/null; then
+            rm -f "$CLOSED_LID_MARKER"
+        else
+            echo "Warning: could not restore closed-lid sleep. Open Awake and turn it off before uninstalling." >&2
+            return 1
+        fi
+    fi
+    remove_power_permission || {
+        echo "Awake was not removed because its system permission could not be removed." >&2
+        return 1
+    }
     remove_legacy_runtime
     remove_legacy_integrations
     rm -rf "$APP_PATH"
     rm -rf "$HOME/.local/bin/AwakeSource"
     rm -f "$HOME/.local/bin/awake-build-ui" "$HOME/.local/bin/awake-package.json"
-    rm -f "$STATE_FILE" "$COMMAND_FILE"
+    rm -f "$STATE_FILE" "$COMMAND_FILE" "$CLOSED_LID_MARKER"
     echo "Removed Awake.app. Remove this CLI separately if it was installed globally."
 }
 

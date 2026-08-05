@@ -2,6 +2,8 @@
 
 Report security issues privately to the repository owner. Include the affected version, reproduction steps, impact, and any known mitigation.
 
-Awake runs without root privileges. It owns only its in-process macOS power assertions and releases them when a session stops, a timer expires, or the app exits. It does not change physical display brightness or system power settings.
+Awake itself runs without root privileges. Closed-lid mode installs a root-owned `awake-power` command plus a per-user sudoers rule for exactly `awake-power on <uid>` and `awake-power off <uid>`. The command coordinates the system-wide value across users and exits immediately; no privileged helper stays running. It records the prior value before the first session and restores it after the final session stops, a timer expires, the app exits, or the app next launches after an interrupted session.
+
+Closing a MacBook while it is working can trap heat. Keep it ventilated and never put it in a bag while closed-lid mode is active. Screen blackout is an overlay and does not change physical display or keyboard brightness.
 
 Useful reports include command-mailbox injection, unsafe installer migration, assertion lifecycle bugs, and blackout recovery failures.

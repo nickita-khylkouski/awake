@@ -1,0 +1,71 @@
+#!/bin/sh
+set -eu
+
+state="/Library/Application Support/Awake/power-state"
+owners="$state/owners"
+lock=/var/run/awake-disablesleep.lock
+action="${1:-}"
+owner="${2:-}"
+
+case "$action" in on|off) ;; *) exit 2 ;; esac
+case "$owner" in ''|*[!0-9]*) exit 2 ;; esac
+
+acquire_lock() {
+    attempts=0
+    until /bin/mkdir "$lock" 2>/dev/null; do
+        attempts=$((attempts + 1))
+        if [ "$attempts" -eq 20 ]; then
+            holder="$(/bin/cat "$lock/pid" 2>/dev/null || true)"
+            case "$holder" in *[!0-9]*|'') /bin/rm -rf "$lock" ;; *) /bin/kill -0 "$holder" 2>/dev/null || /bin/rm -rf "$lock" ;; esac
+        fi
+        [ "$attempts" -lt 100 ] || exit 1
+        /bin/sleep 0.05
+    done
+    echo $$ > "$lock/pid"
+    trap '/bin/rm -f "$lock/pid"; /bin/rmdir "$lock" 2>/dev/null || true' EXIT HUP INT TERM
+}
+
+current_value() {
+    /usr/bin/pmset -g | /usr/bin/awk '$1 == "SleepDisabled" && ($2 == 0 || $2 == 1) { print $2; found=1 } END { if (!found) exit 1 }'
+}
+
+acquire_lock
+if [ "$action" = off ] && [ ! -f "$state/prior" ]; then exit 0; fi
+/bin/mkdir -p "$owners"
+/usr/sbin/chown -R root:wheel "${state%/power-state}"
+/bin/chmod 700 "$state" "$owners"
+
+boot="$(/usr/sbin/sysctl -n kern.boottime)"
+saved_boot="$(/bin/cat "$state/boot" 2>/dev/null || true)"
+if [ "$saved_boot" != "$boot" ]; then
+    /bin/rm -f "$owners"/*
+    boot_tmp="$(/usr/bin/mktemp "$state/.boot.XXXXXX")"
+    /usr/bin/printf '%s\n' "$boot" > "$boot_tmp"
+    /bin/chmod 600 "$boot_tmp"
+    /bin/mv -f "$boot_tmp" "$state/boot"
+fi
+
+if [ "$action" = on ]; then
+    if [ ! -f "$state/prior" ]; then
+        prior_tmp="$(/usr/bin/mktemp "$state/.prior.XXXXXX")"
+        if ! current_value > "$prior_tmp"; then /bin/rm -f "$prior_tmp"; exit 1; fi
+        prior="$(/bin/cat "$prior_tmp")"
+        case "$prior" in 0|1) ;; *) /bin/rm -f "$prior_tmp"; exit 1 ;; esac
+        /bin/chmod 600 "$prior_tmp"
+        /bin/mv -f "$prior_tmp" "$state/prior"
+    fi
+    /usr/bin/touch "$owners/$owner"
+    if ! /usr/bin/pmset -a disablesleep 1; then
+        /bin/rm -f "$owners/$owner"
+        if ! /bin/ls -A "$owners" | /usr/bin/grep -q .; then /bin/rm -rf "$state"; fi
+        exit 1
+    fi
+else
+    /bin/rm -f "$owners/$owner"
+    if ! /bin/ls -A "$owners" | /usr/bin/grep -q .; then
+        prior="$(/bin/cat "$state/prior")"
+        case "$prior" in 0|1) ;; *) exit 1 ;; esac
+        /usr/bin/pmset -a disablesleep "$prior"
+        /bin/rm -rf "$state"
+    fi
+fi

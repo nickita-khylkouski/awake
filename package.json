@@ -1,7 +1,7 @@
 {
   "name": "awake-agent",
-  "version": "3.0.0",
-  "description": "A tiny, daemon-free macOS menu-bar app that prevents idle sleep.",
+  "version": "3.1.0",
+  "description": "A tiny macOS menu-bar app that prevents sleep, including with the lid closed.",
   "license": "MIT",
   "os": [
     "darwin"
@@ -18,6 +18,7 @@
     "README.md",
     "awake-screenshot.jpg",
     "awake",
+    "awake-power",
     "awake-build-ui",
     "install.sh",
     "ui/main.swift"

@@ -51,12 +51,14 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 
-cp "$ROOT/awake" "$DESTINATION/awake"
-cp "$0" "$DESTINATION/awake-build-ui"
+cp "$ROOT/awake-power" "$CONTENTS/Resources/awake-power"
+if [ "$ROOT/awake" != "$DESTINATION/awake" ]; then cp "$ROOT/awake" "$DESTINATION/awake"; fi
+if [ "$ROOT/awake-power" != "$DESTINATION/awake-power" ]; then cp "$ROOT/awake-power" "$DESTINATION/awake-power"; fi
+if [ "$0" != "$DESTINATION/awake-build-ui" ]; then cp "$0" "$DESTINATION/awake-build-ui"; fi
 mkdir -p "$DESTINATION/AwakeSource"
 cp "$SOURCE" "$DESTINATION/AwakeSource/main.swift"
 cp "$PACKAGE_JSON" "$DESTINATION/awake-package.json"
-chmod +x "$DESTINATION/awake" "$DESTINATION/awake-build-ui" "$CONTENTS/MacOS/Awake"
+chmod +x "$DESTINATION/awake" "$DESTINATION/awake-power" "$DESTINATION/awake-build-ui" "$CONTENTS/MacOS/Awake" "$CONTENTS/Resources/awake-power"
 /usr/bin/codesign --force --deep --sign - "$STAGED_APP"
 
 NEW_APP="$DESTINATION/.Awake.app.new.$$"

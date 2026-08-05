@@ -8,7 +8,7 @@ trap 'rm -rf "$TMP"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
-bash -n "$ROOT/awake" "$ROOT/awake-build-ui" "$ROOT/install.sh" "$ROOT/package-app.sh"
+bash -n "$ROOT/awake" "$ROOT/awake-power" "$ROOT/awake-build-ui" "$ROOT/install.sh" "$ROOT/package-app.sh"
 pass "shell syntax"
 
 xcrun swiftc -target arm64-apple-macos13.0 \
@@ -49,12 +49,45 @@ pass "daemon-free implementation"
 rg -q 'kIOPMAssertionTypePreventUserIdleSystemSleep' "$ROOT/ui/main.swift" || fail "system assertion missing"
 rg -q 'kIOPMAssertionTypePreventUserIdleDisplaySleep' "$ROOT/ui/main.swift" || fail "display assertion missing"
 rg -q 'event.keyCode == 53' "$ROOT/ui/main.swift" || fail "Escape recovery missing"
+rg -q 'pmset -a disablesleep 1' "$ROOT/awake-power" || fail "closed-lid enable path missing"
+rg -q 'pmset -a disablesleep.*prior' "$ROOT/awake-power" || fail "closed-lid restore path missing"
+rg -q 'helperPath, "on", owner' "$ROOT/ui/main.swift" || fail "coordinated power helper missing"
 pass "power and blackout safety paths"
+
+cat > "$TMP/pmset" <<'SH'
+#!/bin/sh
+if [ "$1" = -g ]; then
+    printf ' SleepDisabled\t\t%s\n' "$(cat "$AWAKE_POWER_TEST_VALUE")"
+elif [ "$1" = -a ] && [ "$2" = disablesleep ]; then
+    printf '%s\n' "$3" > "$AWAKE_POWER_TEST_VALUE"
+else
+    exit 2
+fi
+SH
+chmod +x "$TMP/pmset"
+sed -e "s#/Library/Application Support/Awake/power-state#$TMP/power-state#g" \
+    -e "s#/var/run/awake-disablesleep.lock#$TMP/power-state.lock#g" \
+    -e 's#^/usr/sbin/chown -R root:wheel.*$#:#' \
+    -e "s#/usr/bin/pmset#$TMP/pmset#g" "$ROOT/awake-power" > "$TMP/awake-power"
+chmod +x "$TMP/awake-power"
+export AWAKE_POWER_TEST_VALUE="$TMP/power-value"
+printf '0\n' > "$AWAKE_POWER_TEST_VALUE"
+"$TMP/awake-power" on 501
+"$TMP/awake-power" on 502
+"$TMP/awake-power" off 501
+[ "$(cat "$AWAKE_POWER_TEST_VALUE")" = 1 ] || fail "one user restored while another was active"
+"$TMP/awake-power" off 502
+[ "$(cat "$AWAKE_POWER_TEST_VALUE")" = 0 ] || fail "prior zero value was not restored"
+printf '1\n' > "$AWAKE_POWER_TEST_VALUE"
+"$TMP/awake-power" on 501
+"$TMP/awake-power" off 501
+[ "$(cat "$AWAKE_POWER_TEST_VALUE")" = 1 ] || fail "prior one value was not preserved"
+pass "multi-user power ownership and prior-state restoration"
 
 tarball="$(cd "$ROOT" && npm pack --silent --pack-destination "$TMP" | tail -1)"
 npm install --silent --prefix "$TMP/npm" "$TMP/$tarball"
 version="$($TMP/npm/node_modules/.bin/awake --version)"
-[ "$version" = "awake-agent 3.0.0" ] || fail "npm bin symlink resolution"
+[ "$version" = "awake-agent 3.1.0" ] || fail "npm bin symlink resolution"
 [ -x "$TMP/npm/node_modules/awake-agent/awake-build-ui" ] || fail "npm build helper missing"
 pass "npm package entrypoint"
 
