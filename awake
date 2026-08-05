@@ -95,7 +95,7 @@ show_status() {
         return
     fi
     /usr/bin/python3 - "$json" <<'PY'
-import json, sys
+import json, sys, time
 try:
     state = json.loads(sys.argv[1])
 except Exception:
@@ -103,8 +103,8 @@ except Exception:
     raise SystemExit(1)
 if not state.get("active"):
     print("Awake is off")
-elif state.get("remainingSeconds") is not None:
-    seconds = max(0, int(state["remainingSeconds"]))
+elif state.get("timerEndsAt") is not None:
+    seconds = max(0, int(state["timerEndsAt"] - time.time() + 0.999))
     print(f"Awake is on for {seconds // 60}:{seconds % 60:02d}")
 else:
     print("Awake is on indefinitely")

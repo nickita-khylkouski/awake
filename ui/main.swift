@@ -95,12 +95,16 @@ final class ClosedLidController {
     private var permissionPath: String { "/etc/sudoers.d/awake-\(getuid())" }
     private let helperPath = "/Library/PrivilegedHelperTools/com.awake/awake-power"
     private var owner: String { String(getuid()) }
+    private var cachedSetupComplete: Bool?
     var ownsSetting: Bool { FileManager.default.fileExists(atPath: markerURL.path) }
     private(set) var isActive = false
     var setupComplete: Bool {
-        FileManager.default.fileExists(atPath: permissionPath) &&
+        if let cachedSetupComplete { return cachedSetupComplete }
+        let verified = FileManager.default.fileExists(atPath: permissionPath) &&
         FileManager.default.isExecutableFile(atPath: helperPath) && helperMatchesBundle &&
         !legacyPermissionPresent && permissionAvailable()
+        cachedSetupComplete = verified
+        return verified
     }
     var legacyPermissionPresent: Bool {
         FileManager.default.fileExists(atPath: "/etc/sudoers.d/pmset") ||
@@ -134,7 +138,9 @@ final class ClosedLidController {
         let shell = "umask 077; helperTemporary=$(/usr/bin/mktemp /private/tmp/awake-power.XXXXXX) || exit 1; trap '/bin/rm -f \"$helperTemporary\" \"$temporary\"' EXIT; /bin/cp \(helperSource) \"$helperTemporary\"; /usr/sbin/chown root:wheel \"$helperTemporary\"; /bin/chmod 700 \"$helperTemporary\"; [ \"$(/usr/bin/shasum -a 256 \"$helperTemporary\" | /usr/bin/awk '{print $1}')\" = '\(helperHash)' ] || exit 1; /bin/mkdir -p /Library/PrivilegedHelperTools/com.awake; /usr/sbin/chown root:wheel /Library/PrivilegedHelperTools/com.awake; /bin/chmod 755 /Library/PrivilegedHelperTools/com.awake; for directory in /Library /Library/PrivilegedHelperTools /Library/PrivilegedHelperTools/com.awake; do [ \"$(/usr/bin/stat -f %u \"$directory\")\" = 0 ] || exit 1; mode=$(/usr/bin/stat -f %Lp \"$directory\"); [ $((0$mode & 022)) -eq 0 ] || exit 1; done; /usr/bin/install -o root -g wheel -m 755 \"$helperTemporary\" '\(helperPath)' || exit 1; temporary=$(/usr/bin/mktemp /private/tmp/awake-sudoers.XXXXXX) || exit 1; /usr/bin/printf '%s\\n' '\(rule)' > \"$temporary\" && /usr/sbin/visudo -cf \"$temporary\" && /usr/bin/install -o root -g wheel -m 440 \"$temporary\" '\(permissionPath)' || exit 1; if [ -f /etc/sudoers.d/pmset ] && [ \"$(/bin/cat /etc/sudoers.d/pmset)\" = '\(oldPmset)' ]; then /bin/rm -f /etc/sudoers.d/pmset; fi; if [ -f /etc/sudoers.d/powermetrics ] && [ \"$(/bin/cat /etc/sudoers.d/powermetrics)\" = '\(oldMetrics)' ]; then /bin/rm -f /etc/sudoers.d/powermetrics; fi"
         let escaped = shell.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         let script = "do shell script \"\(escaped)\" with administrator privileges"
-        return run("/usr/bin/osascript", ["-e", script]).status == 0 && setupComplete
+        guard run("/usr/bin/osascript", ["-e", script]).status == 0 else { return false }
+        cachedSetupComplete = nil
+        return setupComplete
     }
 
     func removeLegacyPermission() -> Bool {
@@ -144,7 +150,9 @@ final class ClosedLidController {
         let oldMetrics = "\(username) ALL=(ALL) NOPASSWD: /usr/bin/powermetrics"
         let shell = "if [ -f /etc/sudoers.d/pmset ] && [ \"$(/bin/cat /etc/sudoers.d/pmset)\" = '\(oldPmset)' ]; then /bin/rm -f /etc/sudoers.d/pmset; fi; if [ -f /etc/sudoers.d/powermetrics ] && [ \"$(/bin/cat /etc/sudoers.d/powermetrics)\" = '\(oldMetrics)' ]; then /bin/rm -f /etc/sudoers.d/powermetrics; fi"
         let escaped = shell.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-        return run("/usr/bin/osascript", ["-e", "do shell script \"\(escaped)\" with administrator privileges"]).status == 0 && !legacyPermissionPresent
+        guard run("/usr/bin/osascript", ["-e", "do shell script \"\(escaped)\" with administrator privileges"]).status == 0 else { return false }
+        cachedSetupComplete = nil
+        return !legacyPermissionPresent
     }
 
     func recoverInterruptedSession() {
@@ -478,27 +486,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
+        NSApp.setActivationPolicy(.regular)
+        if !UserDefaults.standard.bool(forKey: "didMigrateStatusItemName") {
+            for legacyName in ["com.awake.menubar.primary", "com.awake.menubar.statusitem", "com.awake.statusitem"] {
+                UserDefaults.standard.removeObject(forKey: "NSStatusItem Preferred Position \(legacyName)")
+                UserDefaults.standard.removeObject(forKey: "NSStatusItem Visible \(legacyName)")
+            }
+            UserDefaults.standard.set(true, forKey: "didMigrateStatusItemName")
+        }
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem.autosaveName = "com.awake"
+        statusItem.isVisible = true
+        statusItem.behavior = []
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(statusItemClicked)
+        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        statusItem.button?.imagePosition = .imageOnly
+        quickMenu.delegate = self
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentSize = NSSize(width: 330, height: 460)
+        updateUI()
+        DispatchQueue.main.async { [weak self] in self?.finishLaunching() }
+    }
+
+    private func finishLaunching() {
         closedLid.recoverInterruptedSession()
         if closedLid.isSupportedMac && !closedLid.setupComplete {
             keepWorkingWithLidClosed = false
             UserDefaults.standard.set(false, forKey: "keepWorkingWithLidClosed")
         }
-        let positionKey = "NSStatusItem Preferred Position com.awake.menubar.primary"
-        if UserDefaults.standard.object(forKey: positionKey) == nil {
-            UserDefaults.standard.set(150, forKey: positionKey)
-        }
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.isVisible = true
-        statusItem.autosaveName = "com.awake.menubar.primary"
-        statusItem.button?.target = self
-        statusItem.button?.action = #selector(statusItemClicked)
-        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
-        statusItem.button?.imagePosition = .imageLeading
-        quickMenu.delegate = self
-        popover.behavior = .transient
-        popover.animates = true
-        popover.contentSize = NSSize(width: 330, height: 460)
         hotKey = GlobalHotKey { [weak self] in self?.toggleBlackout() }
         panelHotKey = GlobalHotKey(
             keyCode: UInt32(kVK_ANSI_A),
@@ -512,9 +529,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.processCommand()
         }
         if let commandTimer { RunLoop.main.add(commandTimer, forMode: .common) }
-        if !closedLid.isSupportedMac {
-            DispatchQueue.main.async { [weak self] in self?.offerLegacyCleanupIfNeeded() }
-        }
+        DispatchQueue.main.async { [weak self] in self?.offerLegacyCleanupIfNeeded() }
         if closedLid.isSupportedMac && !closedLid.setupComplete && !UserDefaults.standard.bool(forKey: "didPresentPanelOnboarding") {
             UserDefaults.standard.set(true, forKey: "didPresentPanelOnboarding")
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.showStandalonePanel() }
@@ -792,7 +807,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             guard let self else { return }
             if let deadline = self.deadline, deadline <= Date() { self.stop() }
-            else { self.updateUI(); self.writeState() }
+            else { self.updateUI() }
         }
         RunLoop.main.add(timer!, forMode: .common)
     }
@@ -918,7 +933,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let symbol = restorationPending ? "exclamationmark.triangle.fill" : (active ? "bolt.fill" : "moon.fill")
         let description = restorationPending ? "Normal sleep needs restoring" : (active ? "Awake is on" : "Awake is off")
         statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: description)
-        statusItem.button?.title = deadline.map { " \(formatRemaining($0.timeIntervalSinceNow))" } ?? " Awake"
+        statusItem.button?.title = ""
         let stateTooltip = restorationPending ? "Normal sleep needs restoring" : (deadline.map { "\(formatRemaining($0.timeIntervalSinceNow)) remaining" } ?? (active ? "On" : "Off"))
         statusItem.button?.toolTip = "Awake: \(stateTooltip)\nLeft-click: controls  Right-click: quick menu\nControl-Shift-A: open controls  Option-1: blackout"
         statusItem.button?.setAccessibilityLabel("Awake")
@@ -937,7 +952,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "closedLidActive": closedLid.isActive,
             "restoreFailed": restorationPending,
             "timerEndsAt": deadline?.timeIntervalSince1970,
-            "remainingSeconds": deadline.map { max(0, Int($0.timeIntervalSinceNow.rounded(.up))) },
             "blackout": blackout.isActive
         ]
         do {

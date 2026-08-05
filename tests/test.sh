@@ -52,6 +52,13 @@ rg -q 'event.keyCode == 53' "$ROOT/ui/main.swift" || fail "Escape recovery missi
 rg -q 'pmset -a disablesleep 1' "$ROOT/awake-power" || fail "closed-lid enable path missing"
 rg -q 'pmset -a disablesleep.*prior' "$ROOT/awake-power" || fail "closed-lid restore path missing"
 rg -q 'helperPath, "on", owner' "$ROOT/ui/main.swift" || fail "coordinated power helper missing"
+rg -Fq 'statusItem(withLength: NSStatusItem.squareLength)' "$ROOT/ui/main.swift" || fail "compact menu bar item missing"
+rg -Fq 'NSApp.setActivationPolicy(.regular)' "$ROOT/ui/main.swift" || fail "Dock app activation policy missing"
+rg -Fq '<key>LSUIElement</key><false/>' "$ROOT/awake-build-ui" || fail "Dock app bundle setting missing"
+rg -Fq 'statusItem.autosaveName = "com.awake"' "$ROOT/ui/main.swift" || fail "stable menu bar identity missing"
+rg -Fq 'statusItem.isVisible = true' "$ROOT/ui/main.swift" || fail "menu bar visibility recovery missing"
+if rg -q 'UserDefaults.standard.set\(150, forKey: positionKey\)' "$ROOT/ui/main.swift"; then fail "private menu bar positioning still present"; fi
+rg -Fq 'private var cachedSetupComplete: Bool?' "$ROOT/ui/main.swift" || fail "closed-lid setup verification is not cached"
 pass "power and blackout safety paths"
 
 cat > "$TMP/pmset" <<'SH'
