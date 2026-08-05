@@ -239,6 +239,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             activeStatusMenuItem = status
             menu.addItem(status)
             menu.addItem(item("Stop", #selector(stopSession), key: "s"))
+            let setTimer = NSMenuItem(title: "Set Timer", action: nil, keyEquivalent: "")
+            setTimer.submenu = durationMenu(extends: false)
+            menu.addItem(setTimer)
             if deadline != nil {
                 let extend = NSMenuItem(title: "Extend", action: nil, keyEquivalent: "")
                 extend.submenu = durationMenu(extends: true)
@@ -289,7 +292,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         for (title, seconds) in durations {
             let label = title.replacingOccurrences(of: "For ", with: extends ? "By " : "")
-            let entry = item(label, #selector(extendDuration(_:)))
+            let action = extends ? #selector(extendDuration(_:)) : #selector(startDuration(_:))
+            let entry = item(label, action)
             entry.tag = seconds
             menu.addItem(entry)
         }
