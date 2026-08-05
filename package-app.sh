@@ -1,33 +1,14 @@
 #!/bin/bash
-# package-app.sh — build a standalone Awake.app and zip it for sharing
 set -euo pipefail
 
-ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
-DIST_DIR="$ROOT_DIR/dist"
-STAGING_HOME="$(mktemp -d /tmp/awake-package-home.XXXXXX)"
-APP_NAME="Awake.app"
-APP_PATH="$DIST_DIR/$APP_NAME"
-ZIP_PATH="$DIST_DIR/Awake-macOS.zip"
+ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+DIST="$ROOT/dist"
+STAGING="$(mktemp -d /tmp/awake-package.XXXXXX)"
+trap 'rm -rf "$STAGING"' EXIT
 
-cleanup() {
-    rm -rf "$STAGING_HOME"
-}
-trap cleanup EXIT
-
-mkdir -p "$DIST_DIR"
-rm -rf "$APP_PATH" "$ZIP_PATH"
-
-echo "[package-app] staging build in $STAGING_HOME"
-(
-    cd "$ROOT_DIR"
-    HOME="$STAGING_HOME" AWAKE_INSTALL_SKIP_RUNTIME=1 AWAKE_INSTALL_NO_OPEN=1 bash ./install.sh >/dev/null
-)
-
-cp -R "$STAGING_HOME/.local/bin/$APP_NAME" "$APP_PATH"
-xattr -cr "$APP_PATH" 2>/dev/null || true
-
-ditto -c -k --keepParent "$APP_PATH" "$ZIP_PATH"
-
-echo "[package-app] created:"
-echo "  $APP_PATH"
-echo "  $ZIP_PATH"
+mkdir -p "$DIST"
+AWAKE_INSTALL_ROOT="$STAGING" "$ROOT/awake-build-ui" >/dev/null
+rm -rf "$DIST/Awake.app" "$DIST/Awake-macOS.zip"
+cp -R "$STAGING/Awake.app" "$DIST/Awake.app"
+/usr/bin/ditto -c -k --keepParent "$DIST/Awake.app" "$DIST/Awake-macOS.zip"
+echo "Created $DIST/Awake-macOS.zip"

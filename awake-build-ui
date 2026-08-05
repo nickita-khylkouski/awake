@@ -1,196 +1,72 @@
 #!/bin/bash
-# awake-build-ui — Compile Swift menu bar app and update Awake.app bundle
-# Usage: awake-build-ui
-# Idempotent: safe to re-run at any time
-
 set -euo pipefail
 
-SRC_DIR="$HOME/.local/bin/AwakeApp"
-SRC_FILE="$SRC_DIR/main.swift"
-PRIVATE_HEADER_FILE="$SRC_DIR/private-apis.h"
-BINARY="$SRC_DIR/AwakeUI"
-BUILD_HASH_FILE="$SRC_DIR/main.swift.sha256"
-APP_DIR="$HOME/.local/bin/Awake.app/Contents"
-APP_ROOT="$HOME/.local/bin/Awake.app"
-RESOURCE_BIN_DIR="$APP_DIR/Resources/bin"
-SCRIPT_SOURCE_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
-REPO_SRC_FILE="$SCRIPT_SOURCE_DIR/ui/main.swift"
-REPO_PRIVATE_HEADER="$SCRIPT_SOURCE_DIR/ui/private-apis.h"
-BUNDLED_UI_SOURCE_DIR="$SCRIPT_SOURCE_DIR/../ui"
-BUNDLED_SRC_FILE="$BUNDLED_UI_SOURCE_DIR/main.swift"
-BUNDLED_PRIVATE_HEADER="$BUNDLED_UI_SOURCE_DIR/private-apis.h"
-PACKAGE_JSON_SOURCE="$SCRIPT_SOURCE_DIR/package.json"
-PACKAGE_JSON_BUNDLED="$SCRIPT_SOURCE_DIR/awake-package.json"
-LOCAL_PACKAGE_JSON="$HOME/.local/bin/awake-package.json"
-ICON_SCRIPT="$SCRIPT_SOURCE_DIR/awake-build-icon"
-ICON_FILE="$APP_DIR/Resources/Awake.icns"
-BUNDLED_UI_DIR="$APP_DIR/Resources/ui"
-
-log() { echo "[awake-build-ui] $(date '+%H:%M:%S') $*"; }
-
-resolve_package_version() {
-    /usr/bin/python3 - "$PACKAGE_JSON_SOURCE" "$LOCAL_PACKAGE_JSON" <<'PY'
-import json
-import os
-import sys
-
-for path in sys.argv[1:]:
-    if not path or not os.path.exists(path):
-        continue
-    try:
-        with open(path) as f:
-            payload = json.load(f)
-        version = payload.get("version")
-        if version:
-            print(version)
-            raise SystemExit(0)
-    except Exception:
-        continue
-
-print("2.0.2")
-PY
-}
-
-PACKAGE_VERSION="$(resolve_package_version "$PACKAGE_JSON_BUNDLED" "$PACKAGE_JSON_SOURCE" "$LOCAL_PACKAGE_JSON")"
-
-# --- 1. Prefer repo source when available ---
-
-if [ -f "$REPO_SRC_FILE" ]; then
-    mkdir -p "$SRC_DIR"
-    cp "$REPO_SRC_FILE" "$SRC_FILE"
-    [ -f "$REPO_PRIVATE_HEADER" ] && cp "$REPO_PRIVATE_HEADER" "$PRIVATE_HEADER_FILE"
-elif [ -f "$BUNDLED_SRC_FILE" ]; then
-    mkdir -p "$SRC_DIR"
-    cp "$BUNDLED_SRC_FILE" "$SRC_FILE"
-    [ -f "$BUNDLED_PRIVATE_HEADER" ] && cp "$BUNDLED_PRIVATE_HEADER" "$PRIVATE_HEADER_FILE"
-fi
-
-# --- 2. Check source exists ---
-
-if [ ! -f "$SRC_FILE" ]; then
-    log "ERROR: $SRC_FILE not found"
-    exit 1
-fi
-
-# --- 3. Decide whether a rebuild is needed ---
-
-SOURCE_HASH="$(
-    {
-        shasum -a 256 "$SRC_FILE"
-        [ -f "$PRIVATE_HEADER_FILE" ] && shasum -a 256 "$PRIVATE_HEADER_FILE"
-    } | shasum -a 256 | awk '{print $1}'
-)"
-PREV_HASH=""
-[ -f "$BUILD_HASH_FILE" ] && PREV_HASH="$(cat "$BUILD_HASH_FILE" 2>/dev/null || true)"
-NEEDS_COMPILE=true
-if [ -x "$BINARY" ] && [ "$SOURCE_HASH" = "$PREV_HASH" ]; then
-    NEEDS_COMPILE=false
-fi
-
-# --- 3. Compile ---
-
-if $NEEDS_COMPILE; then
-    log "Compiling $SRC_FILE... (first build can take ~20-40s)"
-    SWIFTC_ARGS=(-framework AppKit -framework SwiftUI -framework UserNotifications -framework IOKit)
-    if [ -f "$PRIVATE_HEADER_FILE" ]; then
-        SWIFTC_ARGS+=(-import-objc-header "$PRIVATE_HEADER_FILE" -F /System/Library/PrivateFrameworks -framework CoreGraphics -framework CoreBrightness -framework CoreDisplay -framework DisplayServices)
-    fi
-    swiftc "${SWIFTC_ARGS[@]}" -o "$BINARY" "$SRC_FILE"
-    printf '%s\n' "$SOURCE_HASH" > "$BUILD_HASH_FILE"
-    log "Compiled: $(ls -lh "$BINARY" | awk '{print $5}') arm64 binary"
+ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+if [ -f "$ROOT/ui/main.swift" ]; then
+    SOURCE="$ROOT/ui/main.swift"
+    PACKAGE_JSON="$ROOT/package.json"
 else
-    log "Source unchanged; skipping Swift compile"
+    SOURCE="$ROOT/AwakeSource/main.swift"
+    PACKAGE_JSON="$ROOT/awake-package.json"
 fi
+DESTINATION="${AWAKE_INSTALL_ROOT:-$HOME/.local/bin}"
+APP="$DESTINATION/Awake.app"
+BUILD_DIR="$(mktemp -d /tmp/awake-build.XXXXXX)"
+STAGED_APP="$BUILD_DIR/Awake.app"
+CONTENTS="$STAGED_APP/Contents"
+VERSION="$(/usr/bin/python3 - "$PACKAGE_JSON" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))["version"])
+PY
+)"
 
-# --- 4. Create/update app bundle ---
+cleanup() { rm -rf "$BUILD_DIR"; }
+trap cleanup EXIT
 
-mkdir -p "$APP_DIR/MacOS" "$APP_DIR/Resources" "$RESOURCE_BIN_DIR" "$BUNDLED_UI_DIR"
+[ -f "$SOURCE" ] || { echo "Missing $SOURCE" >&2; exit 1; }
+mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$DESTINATION"
 
-# Copy binary into bundle
-cp "$BINARY" "$APP_DIR/MacOS/AwakeUI"
-chmod +x "$APP_DIR/MacOS/AwakeUI"
-log "Installed binary to $APP_DIR/MacOS/AwakeUI"
-
-# Keep the bundle self-contained so it can reinstall/rebuild itself later.
-cp "$SRC_FILE" "$BUNDLED_UI_DIR/main.swift"
-[ -f "$PRIVATE_HEADER_FILE" ] && cp "$PRIVATE_HEADER_FILE" "$BUNDLED_UI_DIR/private-apis.h"
-
-# Copy bundled helper scripts so the .app is self-contained
-for tool in awake awake-hook awake-notify awake-build-ui awake-build-icon; do
-    if [ -f "$SCRIPT_SOURCE_DIR/$tool" ]; then
-        cp "$SCRIPT_SOURCE_DIR/$tool" "$RESOURCE_BIN_DIR/$tool"
-        chmod +x "$RESOURCE_BIN_DIR/$tool"
-    fi
+frameworks=(-framework AppKit -framework Carbon -framework IOKit -framework ServiceManagement)
+for arch in arm64 x86_64; do
+    echo "Building Awake for $arch..."
+    xcrun swiftc -O -target "$arch-apple-macos13.0" "${frameworks[@]}" \
+        -o "$BUILD_DIR/Awake-$arch" "$SOURCE"
 done
-if [ -f "$PACKAGE_JSON_SOURCE" ]; then
-    cp "$PACKAGE_JSON_SOURCE" "$RESOURCE_BIN_DIR/awake-package.json"
-elif [ -f "$LOCAL_PACKAGE_JSON" ]; then
-    cp "$LOCAL_PACKAGE_JSON" "$RESOURCE_BIN_DIR/awake-package.json"
-fi
-log "Bundled helper scripts into $RESOURCE_BIN_DIR"
+xcrun lipo -create "$BUILD_DIR/Awake-arm64" "$BUILD_DIR/Awake-x86_64" -output "$CONTENTS/MacOS/Awake"
 
-if [ -x "$ICON_SCRIPT" ]; then
-    "$ICON_SCRIPT" "$ICON_FILE" >/dev/null
-    log "Generated app icon at $ICON_FILE"
-fi
-
-# Write Info.plist (always overwrite to keep in sync)
-cat > "$APP_DIR/Info.plist" << 'PLIST'
+cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleName</key>
-    <string>Awake</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.awake.menubar</string>
-    <key>CFBundleVersion</key>
-    <string>__AWAKE_VERSION__</string>
-    <key>CFBundleShortVersionString</key>
-    <string>__AWAKE_VERSION__</string>
-    <key>CFBundleExecutable</key>
-    <string>AwakeUI</string>
-    <key>CFBundleIconFile</key>
-    <string>Awake</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleURLTypes</key>
-    <array>
-        <dict>
-            <key>CFBundleURLName</key>
-            <string>com.awake.urls</string>
-            <key>CFBundleURLSchemes</key>
-            <array>
-                <string>awake</string>
-            </array>
-        </dict>
-    </array>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-</dict>
-</plist>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleName</key><string>Awake</string>
+  <key>CFBundleDisplayName</key><string>Awake</string>
+  <key>CFBundleIdentifier</key><string>com.awake.menubar</string>
+  <key>CFBundleExecutable</key><string>Awake</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSUIElement</key><true/>
+  <key>NSHighResolutionCapable</key><true/>
+</dict></plist>
 PLIST
-perl -0pi -e 's/__AWAKE_VERSION__/'"$PACKAGE_VERSION"'/g' "$APP_DIR/Info.plist"
-log "Updated Info.plist (CFBundleExecutable=AwakeUI)"
 
-# Remove old Python launcher if present
-if [ -f "$APP_DIR/MacOS/awake-ui-launcher" ]; then
-    rm "$APP_DIR/MacOS/awake-ui-launcher"
-    log "Removed old Python launcher"
-fi
+cp "$ROOT/awake" "$DESTINATION/awake"
+cp "$0" "$DESTINATION/awake-build-ui"
+mkdir -p "$DESTINATION/AwakeSource"
+cp "$SOURCE" "$DESTINATION/AwakeSource/main.swift"
+cp "$PACKAGE_JSON" "$DESTINATION/awake-package.json"
+chmod +x "$DESTINATION/awake" "$DESTINATION/awake-build-ui" "$CONTENTS/MacOS/Awake"
+/usr/bin/codesign --force --deep --sign - "$STAGED_APP"
 
-# --- 5. Ad-hoc code sign (required for `open` to launch reliably) ---
-
-codesign --force --sign - "$APP_DIR/MacOS/AwakeUI" 2>/dev/null
-codesign --force --sign - "$APP_ROOT" 2>/dev/null
-log "Ad-hoc signed binary and bundle"
-
-# --- 6. Register URL scheme + refresh LaunchServices ---
+NEW_APP="$DESTINATION/.Awake.app.new.$$"
+PREVIOUS_APP="$DESTINATION/.Awake.app.previous.$$"
+mv "$STAGED_APP" "$NEW_APP"
+if [ -d "$APP" ]; then mv "$APP" "$PREVIOUS_APP"; fi
+mv "$NEW_APP" "$APP"
+rm -rf "$PREVIOUS_APP"
 
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-if [ -x "$LSREGISTER" ]; then
-    "$LSREGISTER" -f "$APP_ROOT" >/dev/null 2>&1 || true
-fi
+[ ! -x "$LSREGISTER" ] || "$LSREGISTER" -f "$APP" >/dev/null 2>&1
 
-touch "$APP_ROOT"
-log "Done. Run: open ~/.local/bin/Awake.app"
+echo "Installed $APP"

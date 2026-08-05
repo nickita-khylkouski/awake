@@ -1,7 +1,7 @@
 #!/bin/bash
-# awake installer — run from the repo root: ./install.sh
+# Awake installer. Run from the repository root.
 set -euo pipefail
 
 cd -- "$(dirname -- "$0")"
-chmod +x awake awake-build-ui awake-build-icon awake-hook awake-notify
+chmod +x awake awake-build-ui
 ./awake install

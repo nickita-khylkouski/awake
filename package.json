@@ -1,7 +1,7 @@
 {
   "name": "awake-agent",
-  "version": "2.0.11",
-  "description": "Keep your Mac awake while AI coding agents run.",
+  "version": "3.0.0",
+  "description": "A tiny, daemon-free macOS menu-bar app that prevents idle sleep.",
   "license": "MIT",
   "os": [
     "darwin"
@@ -9,28 +9,28 @@
   "bin": {
     "awake": "awake"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nickita-khylkouski/awake.git"
+  },
   "files": [
     "package.json",
     "README.md",
-    "config.example",
+    "awake-screenshot.jpg",
     "awake",
     "awake-build-ui",
-    "awake-build-icon",
-    "awake-hook",
-    "awake-notify",
     "install.sh",
-    "ui/main.swift",
-    "ui/private-apis.h"
+    "ui/main.swift"
   ],
   "scripts": {
-    "verify:shell": "bash -n awake && bash -n awake-build-ui && bash -n awake-hook && bash -n awake-notify && bash -n install.sh"
+    "test": "bash tests/test.sh",
+    "verify:shell": "bash -n awake && bash -n awake-build-ui && bash -n install.sh"
   },
   "keywords": [
     "macos",
     "menubar",
     "sleep",
-    "claude",
-    "codex",
-    "agent"
+    "caffeine",
+    "awake"
   ]
 }

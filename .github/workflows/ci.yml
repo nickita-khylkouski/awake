@@ -1,0 +1,18 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
+      - run: ./package-app.sh
+      - run: lipo -archs dist/Awake.app/Contents/MacOS/Awake | grep -q 'x86_64 arm64\|arm64 x86_64'
+      - run: npm pack --dry-run
