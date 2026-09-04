@@ -1,12 +1,12 @@
 import AppKit
 import Carbon
 import IOKit.pwr_mgt
+import IOKit.ps
 import ServiceManagement
 import SwiftUI
 
 private let stateURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".config/awake/state.json")
-private let commandURL = stateURL.deletingLastPathComponent().appendingPathComponent("command")
 private let closedLidMarkerURL = stateURL.deletingLastPathComponent().appendingPathComponent("closed-lid-active")
 
 private struct CommandResult {
@@ -354,6 +354,9 @@ struct AwakePanelView: View {
     let active: Bool
     let restorationPending: Bool
     let statusText: String
+    let battery: BatterySnapshot?
+    let batteryError: String?
+    let duration: Int?
     let keepDisplayOn: Bool
     let keepWorkingWithLidClosed: Bool
     let supportsClosedLid: Bool
@@ -370,95 +373,149 @@ struct AwakePanelView: View {
     let showAbout: () -> Void
     let quit: () -> Void
 
+    private var accent: Color { Color(nsColor: .systemOrange) }
+    private var blocked: Bool { battery?.isCritical == true }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 10) {
-                Image(systemName: restorationPending ? "exclamationmark.triangle.fill" : (active ? "bolt.fill" : "moon.fill"))
-                    .font(.system(size: 23, weight: .semibold))
-                    .frame(width: 34, height: 34)
-                    .foregroundStyle(active ? Color.accentColor : Color.secondary)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Awake").font(.headline)
-                    Text(statusText).font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer()
-            }
-
-            Button(action: toggleSession) {
-                Label(active ? "Turn Awake Off" : "Keep Mac Awake", systemImage: active ? "power" : "bolt.fill")
-                    .frame(maxWidth: .infinity)
-            }
-            .controlSize(.large)
-            .buttonStyle(.borderedProminent)
-
-            if restorationPending {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("Normal sleep needs restoring").font(.subheadline.weight(.semibold))
-                    Text("Awake kept the recovery record. Restore the previous system setting now.")
-                        .font(.caption).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Button("Restore Normal Sleep", action: restoreNormalSleep).buttonStyle(.bordered)
-                }
-                .padding(11)
-                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 9))
-            } else if closedLidNeedsSetup {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("Closed-lid mode needs setup").font(.subheadline.weight(.semibold))
-                    Text("Approve one narrow system permission to keep a MacBook working when its lid is closed.")
-                        .font(.caption).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Button("Set Up Closed-Lid Mode", action: toggleClosedLid)
-                        .buttonStyle(.bordered)
-                }
-                .padding(11)
-                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 9))
-            }
-
-            VStack(alignment: .leading, spacing: 7) {
-                Text(active ? "Replace with a timer" : "Start a timer")
-                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 3), spacing: 6) {
-                    timerButton("15m", 15 * 60)
-                    timerButton("30m", 30 * 60)
-                    timerButton("1h", 60 * 60)
-                    timerButton("2h", 2 * 60 * 60)
-                    timerButton("4h", 4 * 60 * 60)
-                    timerButton("8h", 8 * 60 * 60)
-                }
-            }
-
-            Divider()
-
-            Toggle("Keep Display On", isOn: Binding(get: { keepDisplayOn }, set: { _ in toggleDisplay() }))
-            if supportsClosedLid && !closedLidNeedsSetup {
-                Toggle("Keep Working with Lid Closed", isOn: Binding(get: { keepWorkingWithLidClosed }, set: { _ in toggleClosedLid() }))
-            }
-
-            Button(action: toggleBlackout) {
-                Label(blackoutActive ? "Restore Screens" : "Black Out Screens", systemImage: blackoutActive ? "eye.fill" : "eye.slash.fill")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.plain)
-
-            Toggle("Launch at Login", isOn: Binding(get: { launchAtLogin }, set: { _ in toggleLogin() }))
-
-            Divider()
-
+        VStack(alignment: .leading, spacing: 20) {
             HStack {
-                Button("About", action: showAbout).buttonStyle(.plain)
+                Label("Awake", systemImage: "sun.max.fill")
+                    .font(.system(size: 15, weight: .semibold))
                 Spacer()
-                Button("Quit", action: quit).buttonStyle(.plain)
+                HStack(spacing: 5) {
+                    Circle().fill(active ? accent : Color.secondary).frame(width: 6, height: 6)
+                    Text(active ? "ON" : "OFF").font(.system(size: 10, weight: .bold, design: .rounded))
+                }
+                .padding(.horizontal, 9).padding(.vertical, 5)
+                .background(active ? accent.opacity(0.12) : Color.secondary.opacity(0.08), in: Capsule())
             }
-            .font(.caption)
+
+            VStack(alignment: .leading, spacing: 9) {
+                Text(blocked ? "Time to recharge." : (active ? "Your Mac stays awake." : "Let your Mac rest."))
+                    .font(.system(size: 25, weight: .semibold, design: .rounded))
+                    .tracking(-0.6)
+                Text(statusText)
+                    .font(.system(size: 13)).foregroundStyle(.secondary)
+                    .monospacedDigit()
+                Button(action: toggleSession) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "power")
+                        Text(active ? "Turn off" : "Keep awake").fontWeight(.semibold)
+                    }
+                    .frame(maxWidth: .infinity).frame(height: 42)
+                    .foregroundStyle(Color(nsColor: .textBackgroundColor))
+                    .background(blocked ? Color.secondary : Color.primary, in: RoundedRectangle(cornerRadius: 11))
+                    .contentShape(RoundedRectangle(cornerRadius: 11))
+                }
+                .buttonStyle(.plain)
+                .disabled(blocked && !active)
+                .padding(.top, 5)
+            }
+
+            VStack(alignment: .leading, spacing: 9) {
+                HStack {
+                    Text("KEEP AWAKE FOR").font(.system(size: 10, weight: .semibold)).tracking(1)
+                    Spacer()
+                    Menu("More") {
+                        Button("15 minutes") { setDuration(900) }
+                        Button("4 hours") { setDuration(14400) }
+                        Button("8 hours") { setDuration(28800) }
+                    }.menuStyle(.borderlessButton).fixedSize()
+                }.foregroundStyle(.secondary)
+                HStack(spacing: 7) {
+                    durationButton("30 min", seconds: 1800)
+                    durationButton("1 hour", seconds: 3600)
+                    durationButton("2 hours", seconds: 7200)
+                    durationButton("Forever", seconds: 0)
+                }
+            }.disabled(blocked)
+
+            VStack(spacing: 15) {
+                option("Keep display on", detail: "Otherwise, the screen can sleep.", symbol: "display", value: keepDisplayOn, action: toggleDisplay)
+                if supportsClosedLid {
+                    Divider()
+                    if closedLidNeedsSetup {
+                        Button(action: toggleClosedLid) {
+                            HStack {
+                                Image(systemName: "laptopcomputer").frame(width: 22)
+                                Text("Set up closed-lid mode")
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.caption)
+                            }
+                        }.buttonStyle(.plain)
+                    } else {
+                        option("Keep working with lid closed", detail: "Keep your Mac on a ventilated surface.", symbol: "laptopcomputer", value: keepWorkingWithLidClosed, action: toggleClosedLid)
+                    }
+                }
+            }
+            .padding(14)
+            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 13))
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 7) {
+                    Image(systemName: blocked ? "battery.0percent" : "battery.25percent")
+                        .foregroundStyle(blocked ? Color.red : accent)
+                    Text("Auto-sleep at 5%").fontWeight(.medium)
+                    Spacer()
+                    Text(battery.map { "\($0.percent)%" } ?? "—").monospacedDigit()
+                }.font(.system(size: 12))
+                Text(batteryError ?? (blocked ? "Connect power before starting another session." : (battery?.onBattery == true ? "On battery · protection is always on." : (battery == nil ? "Battery reading unavailable." : "On power · sleeps at 5% when unplugged."))))
+                    .font(.system(size: 11)).foregroundStyle(batteryError == nil ? Color.secondary : Color.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                if restorationPending {
+                    Button("Restore normal sleep", action: restoreNormalSleep)
+                        .font(.caption).buttonStyle(.bordered)
+                }
+            }
+            .padding(.horizontal, 2)
+
+            Divider()
+            HStack {
+                Button(action: toggleBlackout) {
+                    Label(blackoutActive ? "Restore screens" : "Black out screens", systemImage: "eye.slash")
+                }.buttonStyle(.plain)
+                Spacer()
+                Menu {
+                    Toggle("Launch at login", isOn: Binding(get: { launchAtLogin }, set: { _ in toggleLogin() }))
+                    Button("About Awake", action: showAbout)
+                    Divider()
+                    Button("Quit Awake", action: quit)
+                } label: {
+                    Image(systemName: "ellipsis.circle").font(.system(size: 16))
+                        .accessibilityLabel("Settings and quit")
+                }.menuStyle(.borderlessButton).fixedSize()
+            }.font(.system(size: 11)).foregroundStyle(.secondary)
         }
-        .padding(16)
-        .frame(width: 330, height: 460, alignment: .top)
+        .padding(22)
+        .frame(width: 380)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .tint(accent)
     }
 
-    private func timerButton(_ label: String, _ seconds: Int) -> some View {
-        Button(label) { setDuration(seconds) }
-            .buttonStyle(.bordered)
-            .frame(maxWidth: .infinity)
+    private func durationButton(_ label: String, seconds: Int) -> some View {
+        let selected = active && (seconds == 0 ? duration == nil : duration == seconds)
+        return Button { setDuration(seconds) } label: {
+            Text(label).font(.system(size: 11, weight: selected ? .semibold : .medium))
+                .frame(maxWidth: .infinity).frame(height: 34)
+                .background(selected ? accent.opacity(0.15) : Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(selected ? accent.opacity(0.6) : Color.clear))
+        }
+        .buttonStyle(.plain)
+        .accessibilityValue(selected ? "Selected" : "")
+    }
+
+    private func option(_ title: String, detail: String, symbol: String, value: Bool, action: @escaping () -> Void) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: symbol).font(.system(size: 17)).foregroundStyle(.secondary).frame(width: 22)
+            Toggle(isOn: Binding(get: { value }, set: { _ in action() })) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title).font(.system(size: 12, weight: .medium))
+                    Text(detail).font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+            }.toggleStyle(.switch).controlSize(.small)
+                .accessibilityLabel(title)
+                .accessibilityHint(detail)
+        }
     }
 }
 
@@ -475,7 +532,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var standalonePanel: NSPanel?
     private var standaloneController: NSHostingController<AwakePanelView>?
     private var timer: Timer?
-    private var commandTimer: Timer?
+    private var batteryTimer: Timer?
+    private var powerSource: CFRunLoopSource?
+    private var battery: BatterySnapshot?
+    private let batteryProtection = BatteryProtection()
+    private var pendingCommands: [AwakeCommand] = []
+    private var isReady = false
+    private var sessionDuration: Int?
     private var deadline: Date?
     private var menuIsOpen = false
     private weak var activeStatusMenuItem: NSMenuItem?
@@ -487,6 +550,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        let appMenu = NSMenu()
+        appMenu.addItem(item("Open Awake", #selector(openControls), key: "o"))
+        appMenu.addItem(item("About Awake", #selector(showAbout)))
+        appMenu.addItem(.separator())
+        appMenu.addItem(item("Quit Awake", #selector(quit), key: "q"))
+        let rootMenu = NSMenu()
+        let appEntry = NSMenuItem(title: "Awake", action: nil, keyEquivalent: "")
+        appEntry.submenu = appMenu
+        rootMenu.addItem(appEntry)
+        NSApp.mainMenu = rootMenu
         if !UserDefaults.standard.bool(forKey: "didMigrateStatusItemName") {
             for legacyName in ["com.awake.menubar.primary", "com.awake.menubar.statusitem", "com.awake.statusitem"] {
                 UserDefaults.standard.removeObject(forKey: "NSStatusItem Preferred Position \(legacyName)")
@@ -505,7 +578,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         quickMenu.delegate = self
         popover.behavior = .transient
         popover.animates = true
-        popover.contentSize = NSSize(width: 330, height: 460)
+        popover.contentSize = NSSize(width: 380, height: 570)
         updateUI()
         DispatchQueue.main.async { [weak self] in self?.finishLaunching() }
     }
@@ -525,10 +598,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateUI()
         writeState()
         if restorationPending { handleRestoreFailure() }
-        commandTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            self?.processCommand()
-        }
-        if let commandTimer { RunLoop.main.add(commandTimer, forMode: .common) }
+        installBatteryProtection()
+        isReady = true
+        let commands = pendingCommands
+        pendingCommands.removeAll()
+        commands.forEach(handleCommand)
         DispatchQueue.main.async { [weak self] in self?.offerLegacyCleanupIfNeeded() }
         if closedLid.isSupportedMac && !closedLid.setupComplete && !UserDefaults.standard.bool(forKey: "didPresentPanelOnboarding") {
             UserDefaults.standard.set(true, forKey: "didPresentPanelOnboarding")
@@ -537,11 +611,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        statusItem.isVisible = true
         showStandalonePanel()
         return false
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        batteryTimer?.invalidate()
+        if let powerSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), powerSource, .commonModes) }
+        deadline = nil
         assertion.stop()
         closedLid.disable()
         blackout.hide()
@@ -584,7 +662,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    @objc private func openControls() { showStandalonePanel() }
+
     private func showStandalonePanel() {
+        statusItem.isVisible = true
+        popover.performClose(nil)
         let view = makePanelView()
         let controller: NSHostingController<AwakePanelView>
         if let standaloneController {
@@ -599,7 +681,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             panel = standalonePanel
         } else {
             panel = NSPanel(
-                contentRect: NSRect(x: 0, y: 0, width: 330, height: 460),
+                contentRect: NSRect(x: 0, y: 0, width: 380, height: 570),
                 styleMask: [.titled, .closable, .utilityWindow],
                 backing: .buffered,
                 defer: false
@@ -611,7 +693,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             panel.contentViewController = controller
             self.standalonePanel = panel
         }
-        panel.center()
+        panel.setContentSize(controller.view.fittingSize)
+        if !panel.isVisible { panel.center() }
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -625,14 +708,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             panelController = controller
             popover.contentViewController = controller
         }
-        if standalonePanel?.isVisible == true { standaloneController?.rootView = view }
+        if standalonePanel?.isVisible == true {
+            standaloneController?.rootView = view
+            if let controller = standaloneController { standalonePanel?.setContentSize(controller.view.fittingSize) }
+        }
     }
 
     private func makePanelView() -> AwakePanelView {
         let active = assertion.isActive
-        let status = restorationPending
+        let status = battery?.isCritical == true
+            ? "Awake is off to protect your battery."
+            : restorationPending
             ? "Normal sleep needs restoring"
-            : deadline.map { "\(formatRemaining($0.timeIntervalSinceNow)) remaining" } ?? (active ? "On indefinitely" : "Normal sleep allowed")
+            : deadline.map { "\(formatRemaining($0.timeIntervalSinceNow)) remaining" } ?? (active ? "No timer set. Turn off whenever you’re done." : "Start a session whenever you need more time.")
         let loginEnabled: Bool
         if #available(macOS 13.0, *) { loginEnabled = SMAppService.mainApp.status == .enabled }
         else { loginEnabled = false }
@@ -640,6 +728,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             active: active,
             restorationPending: restorationPending,
             statusText: status,
+            battery: battery,
+            batteryError: batteryProtection.error,
+            duration: sessionDuration,
             keepDisplayOn: keepDisplayOn,
             keepWorkingWithLidClosed: keepWorkingWithLidClosed,
             supportsClosedLid: closedLid.isSupportedMac,
@@ -651,7 +742,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if self.assertion.isActive { self.stop() }
                 else { _ = self.start(until: nil) }
             },
-            setDuration: { [weak self] seconds in _ = self?.start(until: Date().addingTimeInterval(TimeInterval(seconds))) },
+            setDuration: { [weak self] seconds in _ = self?.start(until: seconds == 0 ? nil : Date().addingTimeInterval(TimeInterval(seconds))) },
             toggleDisplay: { [weak self] in self?.toggleDisplay() },
             toggleClosedLid: { [weak self] in self?.toggleClosedLid() },
             toggleBlackout: { [weak self] in self?.toggleBlackout() },
@@ -764,6 +855,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @discardableResult
     private func start(until: Date?) -> Bool {
+        refreshBattery()
+        guard battery?.isCritical != true else { showStandalonePanel(); return false }
+        if let until, until <= Date() { stop(); return false }
         let wasActive = assertion.isActive
         if keepWorkingWithLidClosed && !closedLid.setupComplete {
             keepWorkingWithLidClosed = false
@@ -778,6 +872,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         do {
             try assertion.start(keepDisplayOn: keepDisplayOn)
             deadline = until
+            sessionDuration = until.map { Int($0.timeIntervalSinceNow.rounded()) }
             scheduleTimer()
             updateUI()
             writeState()
@@ -794,6 +889,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func stop(showRestoreError: Bool = true) {
         assertion.stop()
         deadline = nil
+        sessionDuration = nil
         timer?.invalidate()
         timer = nil
         if !closedLid.disable() && showRestoreError { handleRestoreFailure() }
@@ -917,7 +1013,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.icon = NSImage(systemSymbolName: "cup.and.saucer.fill", accessibilityDescription: "Awake")
         let shortcut = hotKey?.isRegistered == true ? "Press Option-1 or Escape to restore them." : "Press Escape or click to restore them."
         let panelShortcut = panelHotKey?.isRegistered == true ? "Press Control-Shift-A to open the control panel.\n\n" : ""
-        alert.informativeText = "When Awake is on, it prevents idle sleep and can keep a MacBook working with its lid closed. A timer turns Awake off and restores normal sleep at zero.\n\n\(panelShortcut)Screen blackout covers every display. \(shortcut)"
+        alert.informativeText = "When Awake is on, it prevents idle sleep and can keep a MacBook working with its lid closed. A timer turns Awake off and restores normal sleep at zero. On battery power, Awake requests sleep at 5% or below, even with no active session.\n\n\(panelShortcut)Screen blackout covers every display. \(shortcut)"
         alert.addButton(withTitle: "OK")
         alert.runModal()
     }
@@ -930,9 +1026,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateUI() {
         let active = assertion.isActive
-        let symbol = restorationPending ? "exclamationmark.triangle.fill" : (active ? "bolt.fill" : "moon.fill")
+        let symbol = restorationPending ? "exclamationmark.triangle.fill" : (active ? "sun.max.fill" : "moon.zzz.fill")
         let description = restorationPending ? "Normal sleep needs restoring" : (active ? "Awake is on" : "Awake is off")
         statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: description)
+        statusItem.button?.image?.isTemplate = true
+        statusItem.button?.image?.size = NSSize(width: 17, height: 17)
         statusItem.button?.title = ""
         let stateTooltip = restorationPending ? "Normal sleep needs restoring" : (deadline.map { "\(formatRemaining($0.timeIntervalSinceNow)) remaining" } ?? (active ? "On" : "Off"))
         statusItem.button?.toolTip = "Awake: \(stateTooltip)\nLeft-click: controls  Right-click: quick menu\nControl-Shift-A: open controls  Option-1: blackout"
@@ -952,7 +1050,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "closedLidActive": closedLid.isActive,
             "restoreFailed": restorationPending,
             "timerEndsAt": deadline?.timeIntervalSince1970,
-            "blackout": blackout.isActive
+            "blackout": blackout.isActive,
+            "pid": ProcessInfo.processInfo.processIdentifier,
+            "batteryPercent": battery?.percent,
+            "onBattery": battery?.onBattery,
+            "autoSleepPercent": 5,
+            "batterySleepRequested": batteryProtection.sleepRequested,
+            "batteryError": batteryProtection.error
         ]
         do {
             try FileManager.default.createDirectory(at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -961,34 +1065,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } catch { }
     }
 
-    private func processCommand() {
-        let claimedURL = commandURL.appendingPathExtension(UUID().uuidString)
-        do { try FileManager.default.moveItem(at: commandURL, to: claimedURL) }
-        catch { return }
-        defer { try? FileManager.default.removeItem(at: claimedURL) }
-        guard let value = try? String(contentsOf: claimedURL, encoding: .utf8) else { return }
-        let parts = value.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-        guard let command = parts.first else { return }
-        let arguments = stride(from: 1, to: parts.count - 1, by: 2).reduce(into: [String: String]()) {
-            $0[parts[$1]] = parts[$1 + 1]
-        }
-        switch command {
-        case "start":
-            if let display = arguments["display"] { keepDisplayOn = display == "1"; UserDefaults.standard.set(keepDisplayOn, forKey: "keepDisplayOn") }
-            if let seconds = arguments["seconds"].flatMap(Double.init), seconds > 0 { start(until: Date().addingTimeInterval(seconds)) }
-            else { start(until: nil) }
-        case "toggle":
-            if assertion.isActive { stop() }
-            else { start(until: nil) }
-        case "stop": stop()
-        case "blackout": if !blackout.isActive { toggleBlackout() }
-        case "show": if blackout.isActive { toggleBlackout() }
-        case "toggle-blackout": toggleBlackout()
-        case "menu": showStandalonePanel()
-        case "about": showAbout()
-        default: break
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for command in urls.compactMap(AwakeCommand.init(url:)) {
+            if isReady { handleCommand(command) }
+            else { pendingCommands.append(command) }
         }
     }
+
+    private func handleCommand(_ command: AwakeCommand) {
+        switch command {
+        case let .start(seconds, display):
+            if let display {
+                keepDisplayOn = display
+                UserDefaults.standard.set(display, forKey: "keepDisplayOn")
+            }
+            start(until: seconds.map { Date().addingTimeInterval($0) })
+        case .toggle:
+            if assertion.isActive { stop() }
+            else { start(until: nil) }
+        case .stop: stop()
+        case .blackout: if !blackout.isActive { toggleBlackout() }
+        case .show: if blackout.isActive { toggleBlackout() }
+        case .menu: showStandalonePanel()
+        case .about: showAbout()
+        }
+    }
+
+    private func installBatteryProtection() {
+        powerSource = IOPSNotificationCreateRunLoopSource({ context in
+            guard let context else { return }
+            Unmanaged<AppDelegate>.fromOpaque(context).takeUnretainedValue().refreshBattery()
+        }, Unmanaged.passUnretained(self).toOpaque())?.takeRetainedValue()
+        if let powerSource { CFRunLoopAddSource(CFRunLoopGetMain(), powerSource, .commonModes) }
+        // A fallback also retries a refused sleep request. No process watching.
+        batteryTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.refreshBattery() }
+        if let batteryTimer { RunLoop.main.add(batteryTimer, forMode: .common) }
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
+        refreshBattery()
+    }
+
+    @objc private func didWake() {
+        if let deadline, deadline <= Date() { stop(showRestoreError: false) }
+        statusItem.isVisible = true
+        refreshBattery()
+    }
+
+    private func refreshBattery() {
+        battery = readBattery()
+        batteryProtection.evaluate(battery, prepare: { [self] in
+            stop(showRestoreError: false)
+            blackout.hide()
+            return !closedLid.ownsSetting
+        }, sleep: {
+            let connection = IOPMFindPowerManagement(0)
+            guard connection != 0 else { return kIOReturnNotReady }
+            defer { IOServiceClose(connection) }
+            return IOPMSleepSystem(connection)
+        })
+        updateUI()
+        writeState()
+    }
+
+    private func readBattery() -> BatterySnapshot? {
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let sources = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] else { return nil }
+        for source in sources {
+            guard let description = IOPSGetPowerSourceDescription(info, source)?.takeUnretainedValue() as? [String: Any],
+                  description[kIOPSTypeKey] as? String == kIOPSInternalBatteryType,
+                  description[kIOPSIsPresentKey] as? Bool != false,
+                  let current = description[kIOPSCurrentCapacityKey] as? Int,
+                  let maximum = description[kIOPSMaxCapacityKey] as? Int,
+                  let state = description[kIOPSPowerSourceStateKey] as? String,
+                  state == kIOPSBatteryPowerValue || state == kIOPSACPowerValue else { continue }
+            return BatterySnapshot(current: current, maximum: maximum, onBattery: state == kIOPSBatteryPowerValue)
+        }
+        return nil
+    }
+
 }
 
 let app = NSApplication.shared

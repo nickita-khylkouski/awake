@@ -6,4 +6,6 @@ Awake itself runs without root privileges. Closed-lid mode installs a root-owned
 
 Closing a MacBook while it is working can trap heat. Keep it ventilated and never put it in a bag while closed-lid mode is active. Screen blackout is an overlay and does not change physical display or keyboard brightness.
 
-Useful reports include command-mailbox injection, unsafe installer migration, assertion lifecycle bugs, and blackout recovery failures.
+Battery protection uses the public `IOPMSleepSystem` API as the console user, after releasing Awake assertions and its closed-lid override. It needs no additional administrator permission. Invalid or external power-source readings never trigger sleep.
+
+Useful reports include command validation, unsafe installer migration, assertion lifecycle bugs, and blackout recovery failures.

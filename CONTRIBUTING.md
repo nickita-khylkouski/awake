@@ -13,7 +13,8 @@ npm pack --dry-run
 Changes must preserve these properties:
 
 - no daemon, agent watcher, lease system, resident privileged process, or private framework
-- the root-owned power command is short-lived and may only coordinate `pmset disablesleep`; no forced-sleep command
+- the root-owned power command is short-lived and may only coordinate `pmset disablesleep`; no privileged forced-sleep command
+- battery protection requests sleep only for a valid internal-battery reading at 5% or below on battery power, after releasing Awake-owned overrides
 - timer expiry always releases the app-owned assertion at zero
 - blackout is overlay-only and restores with `Option-1`, `Escape`, or app termination
 - builds target macOS 13 and contain both `arm64` and `x86_64`

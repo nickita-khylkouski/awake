@@ -21,7 +21,9 @@
     "awake-power",
     "awake-build-ui",
     "install.sh",
-    "ui/main.swift"
+    "ui/main.swift",
+    "ui/PowerPolicy.swift",
+    "ui/icon.swift"
   ],
   "scripts": {
     "test": "bash tests/test.sh",

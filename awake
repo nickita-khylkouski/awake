@@ -35,24 +35,9 @@ EOF
 }
 
 send_url() {
-    local value="$1" command
-    "$OPEN_BIN" -g "$APP_PATH"
-    case "$value" in
-        awake://start\?seconds=*) command="start seconds ${value#*seconds=}" ;;
-        awake://start\?display=*) command="start display ${value#*display=}" ;;
-        awake://start) command="start" ;;
-        awake://toggle) command="toggle" ;;
-        awake://stop) command="stop" ;;
-        awake://blackout) command="blackout" ;;
-        awake://show) command="show" ;;
-        awake://menu) command="menu" ;;
-        awake://about) command="about" ;;
-        *) echo "Invalid Awake command" >&2; return 2 ;;
-    esac
-    mkdir -p "$(dirname -- "$COMMAND_FILE")"
-    local temporary="$COMMAND_FILE.$$"
-    printf '%s\n' "$command" > "$temporary"
-    mv "$temporary" "$COMMAND_FILE"
+    # LaunchServices delivers each command to this app, including during launch.
+    # There is no shared mailbox to overwrite and no resident command poller.
+    "$OPEN_BIN" -g -a "$APP_PATH" "$1"
 }
 
 duration_seconds() {
@@ -61,12 +46,17 @@ duration_seconds() {
         echo "Invalid duration: $value (use 30m, 2h, or 900s)" >&2
         return 2
     }
-    local amount="${BASH_REMATCH[1]}"
-    case "${BASH_REMATCH[2]}" in
-        s) echo "$amount" ;;
-        m) echo $((amount * 60)) ;;
-        h) echo $((amount * 3600)) ;;
+    local amount="${BASH_REMATCH[1]}" unit="${BASH_REMATCH[2]}"
+    # Bound input before Bash arithmetic, which otherwise silently overflows.
+    [ "${#amount}" -le 8 ] || { echo "Duration is too long (maximum 365 days)." >&2; return 2; }
+    local seconds
+    case "$unit" in
+        s) seconds="$amount" ;;
+        m) seconds=$((amount * 60)) ;;
+        h) seconds=$((amount * 3600)) ;;
     esac
+    [ "$seconds" -le 31536000 ] || { echo "Duration is too long (maximum 365 days)." >&2; return 2; }
+    echo "$seconds"
 }
 
 seconds_until() {
@@ -90,17 +80,29 @@ PY
 show_status() {
     local json='{"active":false,"blackout":false,"keepDisplayOn":false}'
     [ -f "$STATE_FILE" ] && json="$(tr -d '\n' < "$STATE_FILE")"
-    if [ "${1:-}" = "--json" ]; then
-        printf '%s\n' "$json"
-        return
-    fi
-    /usr/bin/python3 - "$json" <<'PY'
-import json, sys, time
+    /usr/bin/python3 - "$json" "${1:-}" "$CLOSED_LID_MARKER" <<'PY'
+import json, os, sys, time
 try:
     state = json.loads(sys.argv[1])
 except Exception:
     print("Awake status is unavailable")
     raise SystemExit(1)
+pid = state.get("pid")
+if pid:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        needs_restore = os.path.isfile(sys.argv[3])
+        state.update(active=False, blackout=False, closedLidActive=needs_restore,
+                     restoreFailed=needs_restore, appRunning=False)
+        state.pop("timerEndsAt", None)
+    except PermissionError:
+        pass
+    else:
+        state["appRunning"] = True
+if sys.argv[2] == "--json":
+    print(json.dumps(state, separators=(",", ":")))
+    raise SystemExit(0)
 if not state.get("active"):
     print("Awake is off")
 elif state.get("timerEndsAt") is not None:
@@ -112,6 +114,10 @@ print("Display: kept on" if state.get("keepDisplayOn") else "Display: may sleep"
 print("Closed lid: active" if state.get("closedLidActive") else "Closed lid: off")
 if state.get("restoreFailed"):
     print("Warning: normal sleep needs restoring")
+if "batteryPercent" in state:
+    print(f"Battery: {state['batteryPercent']}% — auto-sleep at 5% on battery")
+if state.get("batteryError"):
+    print(state["batteryError"])
 PY
 }
 
@@ -198,7 +204,7 @@ install_awake() {
     sleep 1
     send_url "awake://start"
     remove_legacy_integrations
-    echo "Awake is installed. Finish onboarding if prompted; the queued session will start afterward."
+    echo "Awake is installed. Automatic sleep protection is enabled at 5% battery."
 }
 
 uninstall_awake() {
@@ -272,7 +278,7 @@ case "$command" in
         show_status "${2:-}"
         ;;
     sleep)
-        echo "Awake never forces your Mac to sleep. Use the Apple menu or allow normal sleep with: awake off" >&2
+        echo "Use the Apple menu to sleep now, or allow normal sleep with: awake off. Awake automatically sleeps at 5% on battery." >&2
         exit 2
         ;;
     install)

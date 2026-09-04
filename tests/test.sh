@@ -13,7 +13,7 @@ pass "shell syntax"
 
 xcrun swiftc -target arm64-apple-macos13.0 \
     -framework AppKit -framework Carbon -framework IOKit -framework ServiceManagement -framework SwiftUI \
-    -typecheck "$ROOT/ui/main.swift"
+    -typecheck "$ROOT/ui/main.swift" "$ROOT/ui/PowerPolicy.swift"
 pass "Swift typecheck at macOS 13 deployment target"
 
 cat > "$TMP/open" <<'SH'
@@ -24,21 +24,28 @@ chmod +x "$TMP/open"
 export AWAKE_OPEN_BIN="$TMP/open" AWAKE_TEST_LOG="$TMP/urls" AWAKE_STATE_FILE="$TMP/state.json" AWAKE_COMMAND_FILE="$TMP/command"
 
 "$ROOT/awake" for 30m
-grep -Fq 'start seconds 1800' "$TMP/command" || fail "30m command"
+grep -Fq 'awake://start?seconds=1800' "$TMP/urls" || fail "30m command"
 pass "duration parsing"
 
 if "$ROOT/awake" for 0m >/dev/null 2>&1; then fail "zero duration accepted"; fi
 if "$ROOT/awake" for banana >/dev/null 2>&1; then fail "invalid duration accepted"; fi
+if "$ROOT/awake" for 99999999999999999999999h >/dev/null 2>&1; then fail "overflow accepted"; fi
 pass "invalid durations rejected"
 
 "$ROOT/awake" nosleep-display
-grep -Fq 'start display 0' "$TMP/command" || fail "display mode command"
+grep -Fq 'awake://start?display=0' "$TMP/urls" || fail "display mode command"
 "$ROOT/awake" off
-grep -Fq 'stop' "$TMP/command" || fail "stop command"
+grep -Fq 'awake://stop' "$TMP/urls" || fail "stop command"
 pass "legacy aliases"
 
 "$ROOT/awake" status --json | /usr/bin/python3 -m json.tool >/dev/null
 pass "status JSON"
+export AWAKE_CLOSED_LID_MARKER="$TMP/closed-lid"
+printf 'owned' > "$AWAKE_CLOSED_LID_MARKER"
+printf '{"pid":2147483647,"active":true,"closedLidActive":true,"timerEndsAt":9999999999}' > "$AWAKE_STATE_FILE"
+"$ROOT/awake" status --json | /usr/bin/python3 -c 'import json,sys; s=json.load(sys.stdin); assert not s["active"] and not s["appRunning"] and s["restoreFailed"] and "timerEndsAt" not in s'
+rm "$AWAKE_STATE_FILE" "$AWAKE_CLOSED_LID_MARKER"
+pass "stopped app does not claim active assertions or hide pending power restoration"
 
 if rg -n 'sleepnow|pgrep|daemon-agent|awake-leases|CoreBrightness|DisplayServices' \
     "$ROOT/ui/main.swift" "$ROOT/awake"; then
@@ -97,5 +104,9 @@ version="$($TMP/npm/node_modules/.bin/awake --version)"
 [ "$version" = "awake-agent 3.2.0" ] || fail "npm bin symlink resolution"
 [ -x "$TMP/npm/node_modules/awake-agent/awake-build-ui" ] || fail "npm build helper missing"
 pass "npm package entrypoint"
+
+cp "$ROOT/tests/power-policy.swift" "$TMP/main.swift"
+xcrun swiftc "$ROOT/ui/PowerPolicy.swift" "$TMP/main.swift" -o "$TMP/power-tests"
+"$TMP/power-tests"
 
 echo "All tests passed."

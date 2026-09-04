@@ -9,6 +9,7 @@ else
     SOURCE="$ROOT/AwakeSource/main.swift"
     PACKAGE_JSON="$ROOT/awake-package.json"
 fi
+SOURCE_DIR="$(dirname -- "$SOURCE")"
 DESTINATION="${AWAKE_INSTALL_ROOT:-$HOME/.local/bin}"
 APP="$DESTINATION/Awake.app"
 BUILD_DIR="$(mktemp -d /tmp/awake-build.XXXXXX)"
@@ -30,7 +31,7 @@ frameworks=(-framework AppKit -framework Carbon -framework IOKit -framework Serv
 for arch in arm64 x86_64; do
     echo "Building Awake for $arch..."
     xcrun swiftc -O -target "$arch-apple-macos13.0" "${frameworks[@]}" \
-        -o "$BUILD_DIR/Awake-$arch" "$SOURCE"
+        -o "$BUILD_DIR/Awake-$arch" "$SOURCE" "$SOURCE_DIR/PowerPolicy.swift"
 done
 xcrun lipo -create "$BUILD_DIR/Awake-arm64" "$BUILD_DIR/Awake-x86_64" -output "$CONTENTS/MacOS/Awake"
 
@@ -41,23 +42,33 @@ cat > "$CONTENTS/Info.plist" <<PLIST
   <key>CFBundleName</key><string>Awake</string>
   <key>CFBundleDisplayName</key><string>Awake</string>
   <key>CFBundleIdentifier</key><string>com.awake.menubar</string>
+  <key>CFBundleIconFile</key><string>Awake</string>
   <key>CFBundleExecutable</key><string>Awake</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><false/>
+  <key>CFBundleURLTypes</key><array><dict>
+    <key>CFBundleURLName</key><string>com.awake.commands</string>
+    <key>CFBundleURLSchemes</key><array><string>awake</string></array>
+    <key>CFBundleTypeRole</key><string>Editor</string>
+  </dict></array>
   <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
 
+xcrun swift "$SOURCE_DIR/icon.swift" "$BUILD_DIR/Awake.iconset"
+/usr/bin/iconutil -c icns "$BUILD_DIR/Awake.iconset" -o "$CONTENTS/Resources/Awake.icns"
 cp "$ROOT/awake-power" "$CONTENTS/Resources/awake-power"
 if [ "$ROOT/awake" != "$DESTINATION/awake" ]; then cp "$ROOT/awake" "$DESTINATION/awake"; fi
 if [ "$ROOT/awake-power" != "$DESTINATION/awake-power" ]; then cp "$ROOT/awake-power" "$DESTINATION/awake-power"; fi
 if [ "$0" != "$DESTINATION/awake-build-ui" ]; then cp "$0" "$DESTINATION/awake-build-ui"; fi
 mkdir -p "$DESTINATION/AwakeSource"
-cp "$SOURCE" "$DESTINATION/AwakeSource/main.swift"
-cp "$PACKAGE_JSON" "$DESTINATION/awake-package.json"
+if [ "$SOURCE_DIR" != "$DESTINATION/AwakeSource" ]; then
+    cp "$SOURCE" "$SOURCE_DIR/PowerPolicy.swift" "$SOURCE_DIR/icon.swift" "$DESTINATION/AwakeSource/"
+fi
+if [ "$PACKAGE_JSON" != "$DESTINATION/awake-package.json" ]; then cp "$PACKAGE_JSON" "$DESTINATION/awake-package.json"; fi
 chmod +x "$DESTINATION/awake" "$DESTINATION/awake-power" "$DESTINATION/awake-build-ui" "$CONTENTS/MacOS/Awake" "$CONTENTS/Resources/awake-power"
 /usr/bin/codesign --force --deep --sign - "$STAGED_APP"
 
@@ -69,6 +80,6 @@ mv "$NEW_APP" "$APP"
 rm -rf "$PREVIOUS_APP"
 
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-[ ! -x "$LSREGISTER" ] || "$LSREGISTER" -f "$APP" >/dev/null 2>&1
+if [ "${AWAKE_REGISTER_APP:-1}" = 1 ] && [ -x "$LSREGISTER" ]; then "$LSREGISTER" -f "$APP" >/dev/null 2>&1; fi
 
 echo "Installed $APP"
