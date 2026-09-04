@@ -39,7 +39,7 @@ final class BatteryProtection {
 
 enum AwakeCommand: Equatable {
     case start(seconds: Double?, display: Bool?)
-    case toggle, stop, blackout, show, menu, about
+    case toggle, stop, blackout, show, menu, controls, about
 
     init?(url: URL) {
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
@@ -71,6 +71,7 @@ enum AwakeCommand: Equatable {
         case "blackout": self = .blackout
         case "show": self = .show
         case "menu": self = .menu
+        case "controls": self = .controls
         case "about": self = .about
         default: return nil
         }

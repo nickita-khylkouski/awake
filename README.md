@@ -52,7 +52,8 @@ awake nosleep-display
 awake blackout
 awake screens show
 awake status --json
-awake ui
+awake ui                    # Standalone controls
+awake menu                  # Controls anchored to the menu-bar icon
 ```
 
 The CLI delivers commands directly to Awake through LaunchServices, including during app startup. There is no shared command file or command polling loop. Status JSON includes the battery level and 5% protection state.

@@ -57,6 +57,8 @@ print("PASS: 5% threshold, AC exclusion, startup at 0%, wake-loop prevention, re
 func command(_ value: String) -> AwakeCommand? { URL(string: value).flatMap(AwakeCommand.init(url:)) }
 check(command("awake://start?seconds=1800") == .start(seconds: 1800, display: nil), "Parse timer")
 check(command("awake://start?display=0") == .start(seconds: nil, display: false), "Parse display mode")
+check(command("awake://controls") == .controls, "Parse standalone controls")
+check(command("awake://menu") == .menu, "Parse menu-bar popover")
 check(command("awake://stop") == .stop, "Parse stop")
 for invalid in ["awake://start?seconds=nan", "awake://start?seconds=inf", "awake://start?seconds=-1", "awake://start?seconds=0", "awake://start?seconds=999999999", "awake://start?seconds=1&seconds=2", "awake://start?display=no", "awake://stop?seconds=1", "awake://start/path", "https://start", "awake://user@start", "awake://start?unknown=1"] {
     check(command(invalid) == nil, "Reject malformed command: \(invalid)")

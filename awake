@@ -266,7 +266,7 @@ case "$command" in
         send_url "awake://show"
         ;;
     ui)
-        send_url "awake://menu"
+        send_url "awake://controls"
         ;;
     menu)
         send_url "awake://menu"
