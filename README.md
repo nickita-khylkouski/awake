@@ -31,7 +31,7 @@ The installer builds a universal Apple Silicon and Intel app at `~/.local/bin/Aw
 - Black Out Screens covers every connected display with a black overlay
 - Launch at Login uses the standard macOS login-item service
 
-Press `Option-1` to toggle screen blackout. `Escape` also restores the screens. Blackout never changes physical monitor or keyboard brightness.
+Press `Option-1` to toggle screen blackout. Clicks and other keys do nothing while blacked out; only `Option-1` restores the screens. Blackout never changes physical monitor or keyboard brightness.
 
 Selecting a timer while Awake is already on replaces the indefinite session with that deadline. The right-click quick menu also has a separate Extend action for an existing timer.
 

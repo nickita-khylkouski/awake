@@ -213,21 +213,20 @@ final class BlackoutWindow: NSWindow {
 }
 
 final class BlackoutView: NSView {
-    var restore: (() -> Void)?
     override var acceptsFirstResponder: Bool { true }
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 { restore?() }
-        else { super.keyDown(with: event) }
-    }
-    override func mouseDown(with event: NSEvent) { restore?() }
-    override func accessibilityPerformPress() -> Bool { restore?(); return true }
+    // Swallow keys and clicks so only Option-1 ends the blackout.
+    override func keyDown(with event: NSEvent) {}
+    override func mouseDown(with event: NSEvent) {}
+    override func rightMouseDown(with event: NSEvent) {}
+    override func otherMouseDown(with event: NSEvent) {}
     override func isAccessibilityElement() -> Bool { true }
-    override func accessibilityRole() -> NSAccessibility.Role? { .button }
-    override func accessibilityLabel() -> String? { "Screen blackout active. Press Escape or click to restore." }
+    override func accessibilityLabel() -> String? { "Screen blackout active. Press Option-1 to restore." }
 }
 
 final class BlackoutController {
     private(set) var isActive = false
+    /// Escape restores only when the Option-1 hotkey could not be registered.
+    var escapeRestores = true
     private var windows: [NSWindow] = []
     private var keyMonitor: Any?
     private var previousApplication: NSRunningApplication?
@@ -252,7 +251,7 @@ final class BlackoutController {
         NSApp.activate(ignoringOtherApps: true)
         NSCursor.hide()
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.keyCode == 53 {
+            if event.keyCode == 53, self?.escapeRestores == true {
                 self?.hide()
                 return nil
             }
@@ -293,7 +292,6 @@ final class BlackoutController {
             let content = BlackoutView(frame: screen.frame)
             content.wantsLayer = true
             content.layer?.backgroundColor = NSColor.black.cgColor
-            content.restore = { [weak self] in self?.hide() }
             window.contentView = content
             window.makeKeyAndOrderFront(nil)
             window.makeFirstResponder(content)
@@ -593,6 +591,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             UserDefaults.standard.set(false, forKey: "keepWorkingWithLidClosed")
         }
         hotKey = GlobalHotKey { [weak self] in self?.toggleBlackout() }
+        blackout.escapeRestores = hotKey?.isRegistered != true
         panelHotKey = GlobalHotKey(
             keyCode: UInt32(kVK_ANSI_A),
             modifiers: UInt32(controlKey | shiftKey),
@@ -1020,7 +1019,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let alert = NSAlert()
         alert.messageText = "Awake"
         alert.icon = NSImage(systemSymbolName: "cup.and.saucer.fill", accessibilityDescription: "Awake")
-        let shortcut = hotKey?.isRegistered == true ? "Press Option-1 or Escape to restore them." : "Press Escape or click to restore them."
+        let shortcut = hotKey?.isRegistered == true ? "Press Option-1 again to restore them." : "Press Escape to restore them."
         let panelShortcut = panelHotKey?.isRegistered == true ? "Press Control-Shift-A to open the control panel.\n\n" : ""
         alert.informativeText = "When Awake is on, it prevents idle sleep and can keep a MacBook working with its lid closed. A timer turns Awake off and restores normal sleep at zero. On battery power, Awake requests sleep at 5% or below, even with no active session.\n\n\(panelShortcut)Screen blackout covers every display. \(shortcut)"
         alert.addButton(withTitle: "OK")
