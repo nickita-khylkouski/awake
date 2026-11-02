@@ -225,10 +225,7 @@ final class BlackoutView: NSView {
 
 final class BlackoutController {
     private(set) var isActive = false
-    /// Escape restores only when the Option-1 hotkey could not be registered.
-    var escapeRestores = true
     private var windows: [NSWindow] = []
-    private var keyMonitor: Any?
     private var previousApplication: NSRunningApplication?
 
     init() {
@@ -250,13 +247,6 @@ final class BlackoutController {
         rebuildWindows()
         NSApp.activate(ignoringOtherApps: true)
         NSCursor.hide()
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.keyCode == 53, self?.escapeRestores == true {
-                self?.hide()
-                return nil
-            }
-            return event
-        }
     }
 
     func hide() {
@@ -264,7 +254,6 @@ final class BlackoutController {
         isActive = false
         windows.forEach { $0.orderOut(nil) }
         windows.removeAll()
-        if let keyMonitor { NSEvent.removeMonitor(keyMonitor); self.keyMonitor = nil }
         NSCursor.unhide()
         previousApplication?.activate(options: [.activateIgnoringOtherApps])
         previousApplication = nil
@@ -591,7 +580,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             UserDefaults.standard.set(false, forKey: "keepWorkingWithLidClosed")
         }
         hotKey = GlobalHotKey { [weak self] in self?.toggleBlackout() }
-        blackout.escapeRestores = hotKey?.isRegistered != true
         panelHotKey = GlobalHotKey(
             keyCode: UInt32(kVK_ANSI_A),
             modifiers: UInt32(controlKey | shiftKey),
@@ -1019,7 +1007,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let alert = NSAlert()
         alert.messageText = "Awake"
         alert.icon = NSImage(systemSymbolName: "cup.and.saucer.fill", accessibilityDescription: "Awake")
-        let shortcut = hotKey?.isRegistered == true ? "Press Option-1 again to restore them." : "Press Escape to restore them."
+        let shortcut = hotKey?.isRegistered == true ? "Press Option-1 again to restore them." : "Option-1 is unavailable, so quit Awake to restore them."
         let panelShortcut = panelHotKey?.isRegistered == true ? "Press Control-Shift-A to open the control panel.\n\n" : ""
         alert.informativeText = "When Awake is on, it prevents idle sleep and can keep a MacBook working with its lid closed. A timer turns Awake off and restores normal sleep at zero. On battery power, Awake requests sleep at 5% or below, even with no active session.\n\n\(panelShortcut)Screen blackout covers every display. \(shortcut)"
         alert.addButton(withTitle: "OK")

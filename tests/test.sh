@@ -55,7 +55,7 @@ pass "daemon-free implementation"
 
 rg -q 'kIOPMAssertionTypePreventUserIdleSystemSleep' "$ROOT/ui/main.swift" || fail "system assertion missing"
 rg -q 'kIOPMAssertionTypePreventUserIdleDisplaySleep' "$ROOT/ui/main.swift" || fail "display assertion missing"
-rg -q 'event.keyCode == 53' "$ROOT/ui/main.swift" || fail "Escape recovery missing"
+rg -Fq 'override func mouseDown(with event: NSEvent) {}' "$ROOT/ui/main.swift" || fail "blackout must ignore clicks"
 rg -q 'pmset -a disablesleep 1' "$ROOT/awake-power" || fail "closed-lid enable path missing"
 rg -q 'pmset -a disablesleep.*prior' "$ROOT/awake-power" || fail "closed-lid restore path missing"
 rg -q 'helperPath, "on", owner' "$ROOT/ui/main.swift" || fail "coordinated power helper missing"

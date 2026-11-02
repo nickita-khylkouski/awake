@@ -16,7 +16,7 @@ Changes must preserve these properties:
 - the root-owned power command is short-lived and may only coordinate `pmset disablesleep`; no privileged forced-sleep command
 - battery protection requests sleep only for a valid internal-battery reading at 5% or below on battery power, after releasing Awake-owned overrides
 - timer expiry always releases the app-owned assertion at zero
-- blackout is overlay-only and restores only with `Option-1` (Escape only if the hotkey cannot register) or app termination
+- blackout is overlay-only and restores only with `Option-1` or app termination
 - builds target macOS 13 and contain both `arm64` and `x86_64`
 
 Prefer removing code over adding another background mechanism.
